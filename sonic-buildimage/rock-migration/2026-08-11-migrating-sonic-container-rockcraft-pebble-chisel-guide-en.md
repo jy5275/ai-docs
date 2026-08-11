@@ -69,7 +69,6 @@ You need, on the host that will run `build_rocks.sh`:
   `rockcraft.skopeo` used to convert the `.rock` OCI archive into the Docker
   daemon.
 - **Docker** daemon (the script ends with `docker save | pigz`).
-- **pigz** for the final gzip.
 - A completed `make target/sonic-vs.img.gz` run — the rock build *consumes*
   `target/debs/resolute/`, `target/files/resolute/`, and
   `target/python-wheels/resolute/`. Rockcraft is not integrated into the
@@ -96,11 +95,11 @@ rootfs from two sources:
    *separate* part, because Rockcraft forbids mixing slices and full packages
    in the same `stage-packages` list.
 
-This is the key trade-off of the chisel approach: the resulting image is
+With base base, the resulting image is
 small and contains only what you want. But you are responsible for
 listing every runtime dependency that the Dockerfile got "for
 free" from the base image. Some packages currently lack chisel slices and
-are staged as full apt packages in a separate part; the goal is to chisel
+are staged as full apt packages in a separate part; the ultimate goal is to chisel
 all of them eventually so that separate part disappears.
 
 
@@ -117,9 +116,6 @@ Concretely:
 - The only other shared file modified is `files/build_templates/docker_image_ctl.j2`,
   made to recognize both pebble and supervisord for readiness checks.
 - New rock-specific files get new names or live in new locations.
-
-This is why the migration reads as "add a parallel path" rather than
-"replace the Dockerfile."
 
 ---
 
@@ -191,8 +187,8 @@ tree. Use this as a template for your own container's analysis.
 | L3 database | `files/90-sonic.conf`, `files/update_chassisdb_config`, `flush_unused_database` | needed | `organize` |
 
 
-The `rules/*.mk` files are the source of truth for what each
-container pulls in, *not* just the `Dockerfile.j2`. For docker-database,
+Apart from `Dockerfile.j2`, the `rules/*.mk` files are also the source of truth 
+for what each container pulls in. For docker-database,
 `$(DOCKER_DATABASE)_DEPENDENT_PACKAGES`, `$(DOCKER_DATABASE)_PYTHON_WHEELS`,
 and the inherited `$(DOCKER_CONFIG_ENGINE_RESOLUTE)_*` variables together
 define the full dependency set. Read them all.
@@ -226,26 +222,14 @@ services:
     override: replace
     startup: enabled
     on-success: ignore
-    environment:
-      DEBIAN_FRONTEND: "noninteractive"
-      IMAGENAME: "docker-database"
-      DISTRO: "resolute"
   redis:
     command: bash -c "{ [[ -s /var/lib/redis/dump.rdb ]] || rm -f /var/lib/redis/dump.rdb; } && mkdir -p /var/lib/redis && exec /usr/bin/redis-server /etc/redis/redis.conf --bind 127.0.0.1 --port 6379 --unixsocket /var/run/redis/redis.sock --pidfile /var/run/redis/redis.pid --dir /var/lib/redis"
     override: replace
-    environment:
-      DEBIAN_FRONTEND: "noninteractive"
-      IMAGENAME: "docker-database"
-      DISTRO: "resolute"
   flushdb:
     command: bash -c "sleep 300 && /usr/local/bin/flush_unused_database"
     override: replace
     on-success: ignore
     on-failure: ignore
-    environment:
-      DEBIAN_FRONTEND: "noninteractive"
-      IMAGENAME: "docker-database"
-      DISTRO: "resolute"
 ```
 
 These services are ported from `supervisord.conf.j2`. The changes made:
@@ -258,9 +242,6 @@ These services are ported from `supervisord.conf.j2`. The changes made:
 - **`init`** gets `on-success: ignore` so pebble doesn't restart it after
   the one-shot exits. **`flushdb`** gets both `on-success` and `on-failure`
   ignored (best-effort cleanup).
-- Each service gets `environment` with `IMAGENAME`, `DISTRO`, and
-  `DEBIAN_FRONTEND` — these were build-time `ENV` in the Dockerfile; pebble
-  services need them set explicitly.
 - The `redis` command gains a `bash -c` preamble that cleans a stale
   `dump.rdb` and ensures the data dir exists before exec'ing `redis-server`.
   Under supervisord this was handled by the init script.
@@ -291,7 +272,8 @@ packages for which no chisel slice exists yet. `libpython3.14`,
 shared libraries at runtime — the full Ubuntu base image in the Dockerfile
 path provided them transitively.
 
-This part is temporary. The goal is to chisel all of these packages and
+This part is temporary, due to chose packages are not chiselled yet. 
+The ultimate goal is to chisel all of these packages and
 move their slices into the `stage-packages` list of the `setup-database`
 part (section 4.2.4), so `install-unchiselled-packages` disappears
 entirely.
@@ -426,18 +408,8 @@ its slices and which files each slice contains.
     override-prime: |
       craftctl default
 
-      # Create symlinks
       ln -sf /usr/bin/gawk usr/bin/awk
-      ln -sf /usr/bin/python3.14 usr/bin/python3
-
-      # Move python bins
-      mv usr/lib/python3.14/dist-packages/bin/* usr/bin/
-
-      # Make update script executable
       chmod +x usr/local/bin/update_chassisdb_config
-
-      # Copy rsyslog config: this must not be done in the organize step.
-      # Otherwise our rsyslog.conf will be overwritten by stage-package rsyslog's default config.
       cp ${CRAFT_PROJECT_DIR}/files/rsyslog.conf etc/rsyslog.conf
 
       # Configure redis settings (same sed as Dockerfile.j2)
@@ -450,11 +422,8 @@ its slices and which files each slice contains.
 `override-prime` runs after `stage` and is the last chance to mutate the
 primed rootfs.
 
-- **Symlinks** `awk`→`gawk` and `python3`→`python3.14`. With `base: bare`
-  these don't exist until you create them.
-- **`mv usr/lib/python3.14/dist-packages/bin/* usr/bin/`** — some pip wheels
-  install console scripts under `.../dist-packages/bin/`; move them onto
-  `PATH`.
+- **Symlinks** `awk`→`gawk`. With `base: bare`
+  it doesn't exist until you create it.
 - **`chmod +x`** on scripts that lost their exec bit during `dump`.
 - **`rsyslog.conf` must be copied in `override-prime`, not `organize`.** The
   `rsyslog` full package ships its own `/etc/rsyslog.conf`; if you put the
@@ -779,43 +748,24 @@ packages it (and any other rock container images) into the SONiC image.
 
 ---
 
-## 8. Pitfalls and Resolute-specific Notes
+## 8. Pitfalls
 
-### 8.1 Python 3.14 paths
+### 8.1 Python paths must match the runtime version
 
-Resolute ships Python 3.14 (Noble had 3.12). Every Python path in
-`rockcraft.yaml` must use `python3.14` and `usr/lib/python3.14/dist-packages/`:
-the `pip3 install -t` target, the `python3.14_standard` slice, the
-`ln -sf /usr/bin/python3.14 usr/bin/python3` symlink, and the
-`mv usr/lib/python3.14/dist-packages/bin/* usr/bin/` in `override-prime`.
+Every Python path in `rockcraft.yaml` must match the Python version
+shipped in the base: the `pip3 install -t` target, the
+`ln -sf /usr/bin/python3.x usr/bin/python3` symlink, and any
+`mv usr/lib/python3.x/dist-packages/bin/* usr/bin/` in `override-prime`.
 Getting any of these wrong produces a rock where `python3` is missing or
 wheels are installed to a path Python doesn't search.
 
-### 8.2 `jinjanate` vs `j2`
-
-Resolute uses `jinjanate` (the `jinjanator` pip package) for template
-rendering, not the `j2` command (the `j2cli` package) used on Noble. The
-init script calls `jinjanate /usr/share/sonic/templates/...j2`. Ensure
-`jinjanator` is in your pip install list. Check what your container's
-scripts actually invoke.
-
-### 8.3 rsyslog: omrelp, not omfwd
-
-Resolute's `rsyslog.conf` uses the `omrelp` output module (TCP 2514,
-reliable delivery) rather than Noble's `omfwd` (UDP 514). This is why
-`rsyslog-relp` is in `install-unchiselled-packages`. The
-`syslog-layer.yaml` pebble layer's `location: udp://127.0.0.1:514/` is the
-*pebble→rsyslog* hop (local, lossy is fine); rsyslog then forwards to the
-host via omrelp. Don't "fix" the UDP location to TCP — it's intentionally
-the local hop.
-
-### 8.4 Hardcoded deb filenames
+### 8.2 Hardcoded deb filenames
 
 The `dpkg -x debs/libyang3_3.13.6-1ubuntu0.1_amd64.deb ...` lines embed
 versions. When a SONiC package version bumps, the rock build breaks until
 you update the filename. Using globs (`debs/libyang3_*.deb`) avoids this.
 
-### 8.5 The `redis` user and `chown -R redis:redis`
+### 8.3 The `redis` user and `chown -R redis:redis`
 
 Under supervisord, redis runs as the `redis` user, so the init script
 `chown -R redis:redis` the data dirs. Under pebble in the chiselled rock,
@@ -825,7 +775,7 @@ user/group themselves come from the `redis-server_bins` (and
 `override-prime`. If your container runs a daemon as a non-root user,
 verify the user comes from a slice before relying on it.
 
-### 8.6 `rsyslog.conf` copy timing
+### 8.4 `rsyslog.conf` copy timing
 
 As explained in Phase 2, `rsyslog.conf` must be copied in `override-prime`,
 not `organize` — the `rsyslog` stage-package's own `/etc/rsyslog.conf`
@@ -833,7 +783,7 @@ overwrites it during staging. The general rule: put any file that conflicts
 with a stage-package's file in `override-prime`. The symptom of getting this
 wrong is "my rsyslog config is ignored."
 
-### 8.7 Multi-ASIC / VoQ scope
+### 8.5 Multi-ASIC / VoQ scope
 
 The docker-database rock's static pebble services only start one Redis
 instance. The Dockerfile path, by rendering `supervisord.conf.j2` per
@@ -843,17 +793,36 @@ generate a pebble layer per instance and `pebble add` + `pebble replan`.
 That is a fundamentally different architecture from the static services
 defined in `rockcraft.yaml`, and is future work beyond this case study.
 
-### 8.8 `rockcraft.skopeo`, not `skopeo`
+### 8.6 `rockcraft.skopeo`, not `skopeo`
 
 Use the `rockcraft.skopeo` binary shipped with the rockcraft snap. Bare
 `skopeo` may lack the policy support for `.rock` OCI archives. The
 `--insecure-policy` flag is required.
 
-### 8.9 Build graph integration is intentionally absent
+### 8.7 Build graph integration is intentionally absent
 
 `build_rocks.sh` runs on the host after `make`. Folding rockcraft into
 `slave.mk` / `rules/*.mk` would require reworking the `sonic-slave`
 container to include LXD and rockcraft — a separate, larger effort.
+
+### 8.8 Environment variables: Dockerfile `ENV` vs rockcraft `services`
+
+Dockerfile's `ENV DEBIAN_FRONTEND=noninteractive`, `ENV IMAGENAME=...`,
+and `ENV DISTRO=...` are build-time / build-graph variables. They are set
+via `ENV` in the Dockerfile and propagated as container-wide environment
+variables, but no runtime script in these containers actually reads
+them. When migrating to rockcraft, do **not** blindly copy these as
+`environment:` entries on pebble services. Each `environment:` key in
+`rockcraft.yaml` sets a variable only for that specific pebble service,
+not container-wide — and if no runtime code reads the variable, it is
+dead weight. Before adding an `environment:` block, grep the container's
+scripts (`start.sh`, `rest-server.sh`, etc.) to confirm the variable is
+actually referenced at runtime. `DEBIAN_FRONTEND` is an apt-get
+build-time flag; `IMAGENAME` and `DISTRO` are Docker build-graph
+variables injected via `--build-arg`. `CONTAINER_NAME` (needed by
+rsyslog) is injected at container start by `docker_image_ctl.j2`
+(`--env "CONTAINER_NAME"=$DOCKERNAME`), not by the rock's service
+definition.
 
 ---
 
