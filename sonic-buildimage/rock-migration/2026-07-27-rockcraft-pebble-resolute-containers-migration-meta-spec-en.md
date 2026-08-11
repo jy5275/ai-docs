@@ -1,0 +1,733 @@
+# Rockcraft + Pebble Migration: Resolute Containers Meta-Spec
+
+**Date:** 2026-07-27
+**Branch:** `202605_resolute_rock`
+**Scope:** All SONiC containers on `vs` and `broadcom` providing basic network functionality, excluding the three already migrated (docker-database, docker-sonic-mgmt-framework, docker-eventd).
+**Reference:** `feature_noble_build` branch (Noble implementation, consulted but not copied); `dockers/docker-eventd` on Resolute (completed migration, the canonical pattern).
+
+## 1. Goal
+
+Migrate 19 containers from Dockerfile + supervisord to Rockcraft + Pebble on the
+`202605_resolute_rock` branch (Ubuntu 26.04 / Resolute). Both the Dockerfile path and
+the new Rockcraft path must coexist in the same branch for every container.
+
+## 2. Container Inventory and Migration Order
+
+Migration is done one container at a time, easy-to-hard. Each container gets its own
+implementation plan (via the writing-plans skill) referencing this meta-spec for the
+common pattern.
+
+| Order | Container | Base image | Difficulty | Key challenge |
+|-------|-----------|-----------|-----------|---------------|
+| 1 | dockers/docker-router-advertiser | config-engine | ★ | supervisord.conf.j2 conditional radvd; approach A |
+| 2 | dockers/docker-mux | config-engine | ★ | single daemon (linkmgrd); create start.sh |
+| 3 | dockers/docker-macsec | swss-layer | ★ | single daemon (macsecmgrd); wpa_supplicant.conf; create start.sh |
+| 4 | dockers/docker-teamd | swss-layer | ★ | 3 daemons; iproute2 |
+| 5 | dockers/docker-iccpd | swss-layer | ★ | iccpd.sh wrapper; sonic-cfggen renders iccpd.j2 |
+| 6 | dockers/docker-sflow | swss-layer | ★ | 2 daemons; port_index_mapper.py; hsflowd sed |
+| 7 | dockers/docker-sysmgr | config-engine | ★ | single daemon (rebootbackend); 202605 new, no Noble ref; D-Bus mount |
+| 8 | dockers/docker-stp | config-engine | ★ | 2 daemons (stpd, stpmgrd); 202605 new, no Noble ref; start.sh uses supervisorctl |
+| 9 | dockers/docker-nat | swss-layer | ★★ | 2 daemons + restore_nat_entries.py; iptables symlinks |
+| 10 | dockers/docker-lldp | config-engine | ★★ | supervisord.conf.j2 (namespace_id); lldpmgrd 15KB Python; 4 daemons |
+| 11 | dockers/docker-sonic-gnmi | config-engine | ★★ | gnmi-native.sh 150 lines; 2 daemons |
+| 12 | dockers/docker-snmp | config-engine | ★★ | supervisord.conf.j2; snmpd.conf.j2 7KB; PYTHONOPTIMIZE=1; pip-compile hiredis |
+| 13 | dockers/docker-dhcp-server | config-engine | ★★ | kea-dhcp4-server; supervisor group; 4 daemons + group dependency |
+| 14 | dockers/docker-dhcp-relay | config-engine | ★★★ | **approach B**: per-VLAN dynamic relay agents; dynamic pebble layer |
+| 15 | dockers/docker-orchagent | swss-layer | ★★★ | 356-line supervisord.conf.j2; docker-init.j2 rendered at build time; many .j2 templates |
+| 16 | dockers/docker-platform-monitor | config-engine | ★★★★ | 314-line supervisord.conf.j2; 14+ conditional daemons; platform-specific logic; grpcio/thrift pip packages |
+| 17 | dockers/docker-fpm-frr | swss-layer | ★★★★ | 279-line supervisord.conf.j2; FRR routing suite; 4 config modes; frr user/group |
+| 18 | platform/broadcom/docker-syncd-brcm | — | ★★★★ | SAI syncd daemon; Broadcom platform-specific |
+| 19 | platform/vs/docker-syncd-vs | — | ★★★★ | SAI syncd daemon; VS platform-specific |
+
+**Already migrated** (out of scope): docker-database, docker-sonic-mgmt-framework,
+docker-eventd.
+
+**Note on 202605-new containers**: docker-sysmgr and docker-stp are new in the 202605
+branch (no upstream Noble reference). They are simple config-engine based containers
+and follow the standard pattern without special difficulty.
+
+## 3. Architecture Overview
+
+Each container's migration follows the docker-eventd Resolute pattern: flatten the
+Docker three-layer inheritance chain (`docker-base-resolute` → `docker-config-engine-resolute`
+/ `docker-swss-layer-resolute` → specific container) into a single `rockcraft.yaml`.
+
+Key decisions (consistent with docker-eventd, applying to all 19 containers):
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Rockcraft base | `base: ubuntu@26.04` | Full Ubuntu runtime base; image size not a concern |
+| build-base | `build-base: ubuntu@26.04` | Same as base |
+| stage-packages | package names (not chisel slices) | docker-eventd precedent; docker-database uses slices but others use names |
+| build-packages | build-only tools (python3-pip, git, gcc, make) | Build tools must not enter the runtime image |
+| start.sh coexistence | `pgrep -x pebble` detection | Consistent with all migrated containers; both paths share same start.sh |
+| supervisord in rock | Excluded | Rock path uses pebble; no supervisord packages, configs, or directories |
+| Timezone commands in start.sh | Not included | Upstream removed these in 202405/202605 |
+| deb filenames in rockcraft.yaml | Wildcards (`*_*.deb`) | Avoids hardcoding versions; resilient to dependency changes |
+| Environment variables on services | None (no DEBIAN_FRONTEND/IMAGENAME/DISTRO) | docker-eventd precedent; these are build-time variables |
+| Stage filter (prime) | Not used | Image size not a concern |
+
+### 3.1 Why build-packages vs stage-packages
+
+`build-packages` are installed in the build-base environment for the build step only and
+do **not** enter the final rock. `stage-packages` are unpacked into the stage directory
+and become part of the final rock's runtime. Build-only tools (compilers, `-dev` headers,
+`python3-pip`, `git`) belong in `build-packages`; runtime dependencies belong in
+`stage-packages`. This keeps the runtime image free of build tooling.
+
+## 4. Shared Infrastructure (already in place)
+
+Established by the docker-database / docker-eventd migrations. All 19 containers reuse
+these without modification:
+
+| File | Location | Purpose |
+|------|----------|---------|
+| `files/rsyslog/syslog-layer.yaml` | `rules/scripts.mk` → `RSYSLOG_PEBBLE_LAYER` | Pebble syslog layer; loaded by `pebble add syslog-layer --combine` in start.sh |
+| `dockers/docker-base-resolute/etc/rsyslog.conf` | `rules/scripts.mk` → `RSYSLOG_CONF` | SONiC custom rsyslog config; copied in `override-prime` |
+| `files/build_templates/rsyslog_plugin.conf.j2` | `rules/scripts.mk` → `RSYSLOG_PLUGIN_CONF_J2` | rsyslog plugin config template (eventd and similar) |
+| `files/build_templates/docker_image_ctl.j2` | Already supports pebble + supervisord dual detection | Container start/stop script |
+| `rules/scripts.mk` | `SONIC_COPY_FILES` includes all shared files | make stage copies them to `target/files/resolute/` |
+| `build_rocks.sh` | Repo root | Rock build orchestration; each container appends one line to `rocklist` |
+
+### 4.1 build_rocks.sh per-container change
+
+The only change to `build_rocks.sh` per container is appending the container path to the
+`rocklist` array:
+
+```bash
+rocklist=(
+    "dockers/docker-database"
+    "dockers/docker-sonic-mgmt-framework"
+    "dockers/docker-eventd"
+    "dockers/docker-<name>"        # ← appended per container
+)
+```
+
+The existing staging logic (copy `target/{debs,files,python-wheels}/resolute/*` into the
+container dir, `rockcraft pack`, `rockcraft.skopeo` conversion, `docker save | pigz`)
+requires no changes.
+
+## 5. Standard rockcraft.yaml Skeleton
+
+All containers follow this three-part skeleton (based on docker-eventd). `<container-specific>`
+placeholders are replaced per container.
+
+```yaml
+name: docker-<name>
+summary: SONiC <name> container
+description: A rock for SONiC <name> container
+version: "1.0.0"
+
+base: ubuntu@26.04
+build-base: ubuntu@26.04
+license: Apache-2.0
+
+platforms:
+  amd64:
+
+services:
+  rsyslogd:
+    command: /usr/sbin/rsyslogd -n -iNONE
+    override: replace
+    startup: enabled
+  start:
+    command: /usr/bin/start.sh
+    override: replace
+    startup: enabled
+    on-success: ignore
+    on-failure: ignore
+  <daemon-1>:
+    command: <cmd>
+    override: replace
+    # No startup: key → default disabled, started by start.sh
+  <daemon-2>:
+    command: <cmd>
+    override: replace
+
+parts:
+  setup-<name>:
+    plugin: dump
+    source: .
+    build-packages:
+      - python3-pip          # if override-build needs j2 or pip tools
+    override-build: |
+      craftctl default
+
+      # 1. Install SONiC debs (wildcard filenames)
+      dpkg -x debs/<pkg>_*.deb ${CRAFT_PART_INSTALL}
+      ...
+
+      # 2. Build-time j2 rendering (e.g. rsyslog_plugin.conf), if needed
+      j2 -f json ...
+
+      # 3. Clean up source files
+      rm -rf ${CRAFT_PART_INSTALL}/debs ${CRAFT_PART_INSTALL}/python-wheels
+
+    organize:
+      start.sh: usr/bin/start.sh
+      files/syslog-layer.yaml: usr/share/sonic/templates/syslog-layer.yaml
+      files/swss_vars.j2: usr/share/sonic/templates/swss_vars.j2
+      files/readiness_probe.sh: usr/bin/readiness_probe.sh
+      files/container_startup.py: usr/share/sonic/scripts/container_startup.py
+      <container-file>: <dest-path>
+
+    stage-packages:
+      # Base runtime packages (inherited from config-engine layer)
+      - rsyslog
+      - rsyslog-relp
+      - python3
+      - redis-tools
+      - iproute2
+      - net-tools
+      - jq
+      - libzmq5
+      - libwrap0
+      - libatomic1
+      - libdaemon0
+      - libdbus-1-3
+      - libjansson4
+      - python3-redis
+      - python3-yaml
+      # SONiC deb runtime dependencies
+      - libboost-serialization1.83.0
+      - libhiredis1.1.0
+      - libuuid1
+      - libxxhash0
+      # <container-specific packages>
+
+    override-prime: |
+      craftctl default
+
+      cp ${CRAFT_PROJECT_DIR}/files/rsyslog.conf etc/rsyslog.conf
+      cp ${CRAFT_PROJECT_DIR}/manifest.json manifest.json
+
+  install-python:
+    plugin: python
+    source: .
+    python-packages:
+      # config-engine inherited SONiC wheels
+      - ./python-wheels/sonic_py_common-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_yang_mgmt-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_yang_models-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_containercfgd-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_config_engine-1.0-py3-none-any.whl
+      # common pip packages
+      - jinjanator
+      - click
+      - pyangbind==0.8.7
+      - lxml
+      # <container-specific pip packages>
+    stage-packages:
+      - python3-venv
+
+  add-user:
+    plugin: nil
+    after: [setup-<name>]
+    overlay-script: |
+      groupadd -R $CRAFT_OVERLAY syslog
+      useradd -R $CRAFT_OVERLAY -M -r --system -g adm syslog
+    prime:
+      - etc/passwd
+      - etc/group
+```
+
+### 5.1 Design notes for the skeleton
+
+- **`organize` over `cp`**: Source file placement uses `organize` (declarative) rather
+  than `cp` in `override-build`/`override-prime`. The only exceptions are `rsyslog.conf`
+  (the `rsyslog` stage-package overwrites it with a default config, so it must be copied
+  in `override-prime` after staging) and `manifest.json` (must be at the rock root).
+- **deb wildcards**: `dpkg -x debs/<pkg>_*.deb` avoids hardcoding version numbers.
+- **python symlink**: not needed. The `python3-minimal` apt package (pulled in by
+  `stage-packages: [python3]`) already provides `/usr/bin/python3 -> python3.14`.
+- **add-user part**: Creates the `syslog` user/group needed by rsyslog, using
+  `overlay-script` in the overlay chroot where `/etc/passwd` and `/etc/group` come from
+  the `ubuntu@26.04` base.
+- **Noble reference deviation**: Noble's rockcraft.yaml files use many per-deb parts
+  (`install-<deb>_<version>_amd64`) plus a large `install-common-files` part that copies
+  everything via `cp` in `override-prime`. Resolute improves on this: a single
+  `setup-<name>` part installs all debs via `dpkg -x` and places files via `organize`.
+  This is more concise and more declarative.
+
+## 6. start.sh Universal Pattern
+
+Every container's `start.sh` follows this structure:
+
+```bash
+#!/usr/bin/env bash
+
+# <container's existing init logic preserved verbatim>
+
+if pgrep -x pebble > /dev/null 2>&1; then
+    LAYER_FILE="/usr/share/sonic/templates/syslog-layer.yaml"
+    pebble add syslog-layer --combine $LAYER_FILE
+    pebble replan
+    pebble start <daemon-1>
+    pebble start <daemon-2>
+fi
+```
+
+- **Docker path (supervisord)**: `pgrep -x pebble` returns false. Only the existing init
+  logic runs; daemons are started by supervisord's `dependent_startup_wait_for`.
+- **Rock path (pebble)**: `pgrep -x pebble` returns true. Loads syslog layer, replans,
+  then explicitly starts daemons via `pebble start`.
+- **No timezone commands**: upstream removed these in 202405/202605.
+- **No environment variables on pebble services**: consistent with docker-eventd.
+
+## 7. Conditional Daemon Handling: Approach A and B
+
+### 7.1 Approach A — static services + start.sh on-demand start (default)
+
+**Applies to**: all containers except docker-dhcp-relay.
+
+The `services` section in `rockcraft.yaml` enumerates every daemon the container **may**
+run. All daemons except `rsyslogd` and `start` omit the `startup` key (default `disabled`,
+no auto-start). `start.sh`'s pebble branch reads runtime configuration (via `sonic-cfggen`
+or `sonic-db-cli`) and starts the appropriate daemons with `pebble start <name>`.
+
+The `start` service has `on-success: ignore` so it doesn't restart after exiting.
+Daemon startup order is controlled entirely by the sequence of `pebble start <name>`
+calls in start.sh — no `after:` keys are used, because `pebble start` is an explicit
+one-shot action that does not consult `after:` dependencies.
+
+**Example (docker-lldp)**:
+
+```yaml
+services:
+  rsyslogd:
+    command: /usr/sbin/rsyslogd -n -iNONE
+    override: replace
+    startup: enabled
+  start:
+    command: /usr/bin/start.sh
+    override: replace
+    startup: enabled
+    on-success: ignore
+    on-failure: ignore
+  lldpd:
+    command: /usr/sbin/lldpd -t -f /etc/lldpd.conf
+    override: replace
+  waitfor-lldp-ready:
+    command: /usr/bin/waitfor_lldp_ready.sh
+    override: replace
+    on-success: ignore
+    on-failure: ignore
+  lldp-syncd:
+    command: python3 -m lldp_syncd
+    override: replace
+  lldpmgrd:
+    command: /usr/bin/lldpmgrd
+    override: replace
+```
+
+```bash
+# start.sh pebble branch
+if pgrep -x pebble > /dev/null 2>&1; then
+    LAYER_FILE="/usr/share/sonic/templates/syslog-layer.yaml"
+    pebble add syslog-layer --combine $LAYER_FILE
+    pebble replan
+
+    sonic-cfggen -d -a '{"namespace_id":"$NAMESPACE_ID"}' -t lldpd.conf.j2 -y sonic_version.yml -t lldpdSysDescr.conf.j2 > /etc/lldpd.conf
+    rm -f /var/run/lldpd.socket
+
+    pebble start lldpd
+    pebble start waitfor-lldp-ready
+    pebble start lldp-syncd
+    pebble start lldpmgrd
+fi
+```
+
+### 7.2 Approach B — dynamic pebble layer (docker-dhcp-relay only)
+
+**Applies to**: docker-dhcp-relay (per-VLAN relay agents, count determined at runtime,
+cannot be enumerated statically).
+
+The `services` section declares only static services (`rsyslogd`, `start`, `dhcprelayd`).
+A new file `pebble-layer.j2` translates the original `supervisord.conf.j2` into pebble
+layer YAML format. `start.sh` renders it at startup via `sonic-cfggen -d -t pebble-layer.j2`
+and injects it with `pebble add dhcp-relay-layer --combine`.
+
+```yaml
+services:
+  rsyslogd:
+    command: /usr/sbin/rsyslogd -n -iNONE
+    override: replace
+    startup: enabled
+  start:
+    command: /usr/bin/start.sh
+    override: replace
+    startup: enabled
+    on-success: ignore
+    on-failure: ignore
+  dhcprelayd:
+    command: /usr/local/bin/dhcprelayd
+    override: replace
+```
+
+```bash
+# start.sh pebble branch
+if pgrep -x pebble > /dev/null 2>&1; then
+    LAYER_FILE="/usr/share/sonic/templates/syslog-layer.yaml"
+    pebble add syslog-layer --combine $LAYER_FILE
+    pebble replan
+
+    sonic-cfggen -d -t /usr/share/sonic/templates/pebble-layer.j2 > /tmp/dhcp-relay-layer.yaml
+    pebble add dhcp-relay-layer --combine /tmp/dhcp-relay-layer.yaml
+    pebble replan
+
+    pebble start dhcprelayd
+fi
+```
+
+**supervisord → pebble mapping** (used when writing `pebble-layer.j2`):
+
+| supervisord | pebble |
+|-------------|--------|
+| `[program:name]` | `name:` |
+| `command=...` | `command: ...` |
+| `autostart=false` | (omit `startup`, default disabled) |
+| `dependent_startup_wait_for=X:running` | (no pebble equivalent; order controlled by start.sh's `pebble start` call sequence) |
+| `stopsignal=KILL` | `kill-delay: 0s` |
+| `priority=N` | (no pebble equivalent; order controlled by start.sh) |
+
+### 7.3 Fallback
+
+If docker-platform-monitor or docker-fpm-frr prove too complex for approach A during
+implementation (e.g., the start.sh conditional logic becomes unwieldy), they can fall
+back to approach B by writing a `pebble-layer.j2` following the dhcp-relay pattern. This
+fallback is reserved in the design but not the default.
+
+## 8. Per-Container Migration Notes
+
+This section gives each container's key deviations from the standard skeleton. The three
+already-migrated containers are excluded.
+
+### 8.1 docker-router-advertiser (config-engine base)
+
+- supervisord.conf.j2 rendered at startup, but condition is simple (radvd only on ToR with
+  VLAN IPv6). Approach A.
+- **services**: rsyslogd, start, wait_for_link, radvd (radvd default disabled).
+- **start.sh pebble branch**: render `radvd.conf.j2` and `wait_for_link.sh.j2` via
+  `sonic-cfggen -d`, then conditionally `pebble start radvd`.
+- **stage-packages +=**: radvd.
+- **organize +=**: radvd.conf.j2, wait_for_link.sh.j2 → `usr/share/sonic/templates/`.
+
+### 8.2 docker-mux (config-engine base)
+
+- Single daemon linkmgrd. Noble used a rock-init.sh + `/tmp/init_ok` file-signal pattern;
+  Resolute simplifies to the standard start.sh pattern.
+- **services**: rsyslogd, start, linkmgrd.
+- **No existing start.sh** — must **create** start.sh with pebble branch
+  (`pebble start linkmgrd`).
+- **linkmgrd command**: `nice -n -20 /usr/sbin/linkmgrd -v warning -d -l`.
+- **stage-packages +=**: libboost-thread/log/program-options/filesystem1.83.0,
+  libevent-2.1-7, libxml2.
+
+### 8.3 docker-macsec (swss-layer base)
+
+- Single daemon macsecmgrd.
+- **services**: rsyslogd, start, macsecmgrd.
+- **No existing start.sh** — must **create** start.sh.
+- **organize +=**: `etc/wpa_supplicant.conf: etc/wpa_supplicant.conf`, `cli/: cli/`.
+- **stage-packages +=**: swss-layer inherited (libteam5, libteamdctl0, libsairedis,
+  libsaimetadata, swss debs) + macsec-specific (wpasupplicant deb, libpcsclite1,
+  liblua5.1-0).
+
+### 8.4 docker-teamd (swss-layer base)
+
+- 3 daemons: teammgrd, teamsyncd, tlm_teamd.
+- **services**: rsyslogd, start, teammgrd, teamsyncd, tlm_teamd.
+- **start.sh**: existing (`rm -f /var/run/teamd/*; mkdir -p /var/warmboot/teamd`), append
+  pebble branch.
+- **stage-packages +=**: iproute2 (teammgrd needs `ip` binary) + swss-layer inherited.
+- **special**: teammgrd `stopwaitsecs=60` → `kill-delay: 60s`; teamsyncd `startsecs=5` →
+  start.sh calls `pebble start teamsyncd` after teammgrd.
+
+### 8.5 docker-iccpd (swss-layer base)
+
+- 1 daemon iccpd (via iccpd.sh wrapper starting mclagsyncd + iccpd as background).
+- **services**: rsyslogd, start, iccpd.
+- **start.sh**: existing (`sonic-cfggen -d -t iccpd.j2 > /etc/iccpd/iccpd.conf`), append
+  pebble branch.
+- **iccpd.sh**: wrapper script, runs mclagsyncd + iccpd in background, blocks on `read`.
+  Used directly as pebble service command.
+- **organize +=**: iccpd.sh, iccpd.j2 → templates.
+- **stage-packages +=**: iptables, ebtables.
+- **No critical_processes file** (unique among surveyed containers).
+
+### 8.6 docker-sflow (swss-layer base)
+
+- 2 daemons: sflowmgrd, port_index_mapper.
+- **services**: rsyslogd, start, sflowmgrd, port_index_mapper.
+- **No existing start.sh** — must **create** start.sh.
+- **organize +=**: port_index_mapper.py.
+- **stage-packages +=**: dmidecode.
+- **special**: Dockerfile does `sed -ri '/^DAEMON_ARGS=""/c ...' /etc/init.d/hsflowd` —
+  place this sed in `override-build` operating on `${CRAFT_PART_INSTALL}`.
+
+### 8.7 docker-sysmgr (config-engine base)
+
+- Single daemon: rebootbackend. 202605-new container, no Noble reference.
+- **services**: rsyslogd, start, rebootbackend.
+- **No existing start.sh** — must **create** start.sh (pebble branch: `pebble start
+  rebootbackend`).
+- **sysmgr.sh**: wrapper script (`exec /usr/local/bin/sysmgr --logtostderr`). Not a
+  supervisord program — install via organize, the `rebootbackend` service runs
+  `/usr/bin/rebootbackend` directly.
+- **organize +=**: sysmgr.sh → `usr/bin/` (if needed at runtime).
+- **stage-packages +=**: libdbus-1-3, libdbus-c++-1-0v5.
+- **special**: mounts `/var/run/dbus` (D-Bus system bus). Docker path RUN_OPT includes
+  `-v /var/run/dbus:/var/run/dbus:rw`; the rock's `docker run` command must replicate
+  this mount for the container to function.
+
+### 8.8 docker-stp (config-engine base)
+
+- 2 daemons: stpd, stpmgrd. 202605-new container, no Noble reference.
+- **services**: rsyslogd, start, stpd, stpmgrd.
+- **start.sh**: existing (`rm -f /var/run/rsyslogd.pid; rm -f /var/run/stpd/*; rm -f
+  /var/run/stpmgrd/*; supervisorctl start rsyslogd; supervisorctl start stpd;
+  supervisorctl start stpmgrd`). The `supervisorctl` calls must be replaced by pebble
+  equivalents in the pebble branch: `pebble start stpd; pebble start stpmgrd`. rsyslogd
+  is auto-started (`startup: enabled`), no need to start it explicitly.
+- **organize +=**: start.sh (already in standard skeleton).
+- **stage-packages +=**: libdaemon0, libjansson4, libjemalloc2, ebtables.
+- **special**: Dockerfile installs `libpython3.11` — on Resolute this should be
+  `libpython3.14` (or omitted if already pulled in by `python3` stage-package).
+
+### 8.9 docker-nat (swss-layer base)
+
+- 3 daemons: natmgrd, natsyncd, restore_nat_entries.
+- **services**: rsyslogd, start, natmgrd, natsyncd, restore_nat_entries.
+- **start.sh**: existing (`rm -f /var/run/nat/*; mkdir -p /var/warmboot/nat`), append
+  pebble branch.
+- **organize +=**: restore_nat_entries.py.
+- **stage-packages +=**: bridge-utils, conntrack, iptables.
+- **special**: iptables symlinks (iptables→iptables-nft etc.) in `override-prime` via
+  `ln -s` (organize cannot create symlinks).
+
+### 8.10 docker-lldp (config-engine base)
+
+- 4 daemons: lldpd, waitfor-lldp-ready, lldp-syncd, lldpmgrd.
+- supervisord.conf.j2 rendered at startup (namespace_id). Approach A.
+- **services**: rsyslogd, start, lldpd, waitfor-lldp-ready, lldp-syncd, lldpmgrd.
+- **start.sh**: existing (renders lldpd.conf, lldpdSysDescr.conf, clears socket), append
+  pebble branch starting all four daemons in order.
+- **organize +=**: lldpmgrd (15KB Python script), lldpd (default config → etc/default/),
+  waitfor_lldp_ready.sh, *.j2 templates.
+- **python-packages +=**: lldp_syncd wheel (if in docker_lldp_whls).
+
+### 8.11 docker-sonic-gnmi (config-engine base)
+
+- 2 daemons: gnmi-native, dialout.
+- **services**: rsyslogd, start, gnmi-native, dialout.
+- **start.sh**: existing (container_startup.py + config_status), append pebble branch.
+- **organize +=**: gnmi-native.sh, dialout.sh, telemetry_vars.j2.
+- **stage-packages +=**: libxml2, libevent-2.1-7.
+
+### 8.12 docker-snmp (config-engine base)
+
+- 2 daemons: snmpd, snmp-subagent.
+- supervisord.conf.j2 rendered at startup. Approach A.
+- **services**: rsyslogd, start, snmpd, snmp-subagent.
+- **start.sh**: existing (snmp_yml_to_configdb.py + sonic-cfggen renders snmpd.conf),
+  append pebble branch.
+- **organize +=**: snmp_yml_to_configdb.py, *.j2 templates.
+- **stage-packages +=**: snmp, snmpd, ipmitool.
+- **python-packages +=**: hiredis, pyyaml, smbus.
+- **special**: `PYTHONOPTIMIZE=1` → rockcraft.yaml top-level `environment:`. Build-time
+  `python3 -m sonic_ax_impl install` → `override-build`. pip-compile hiredis needs
+  python3-dev, gcc, make → these go in **build-packages** (not stage-packages).
+
+### 8.13 docker-dhcp-server (config-engine base)
+
+- 2 daemons + supervisor group: dhcpservd, kea-dhcp4. Original used group
+  `dhcp-server-ipv4`.
+- **services**: rsyslogd, start, dhcpservd, dhcpservd-ready (wait_for_dhcpservd.sh),
+  kea-dhcp4. Pebble has no group concept; startup order is controlled by start.sh's
+  `pebble start` call sequence: dhcpservd → dhcpservd-ready → kea-dhcp4.
+- **start.sh**: existing (container_startup.py), append pebble branch.
+- **docker_init.sh**: creates kea dirs, chmod, gets udp_server_ip. Rock path: dir creation
+  moves to `override-prime` or start.sh.
+- **organize +=**: kea-dhcp4.conf.j2, kea-dhcp4-init.conf, lease_update.sh,
+  wait_for_dhcpservd.sh, docker_init.sh (merge logic into start.sh if needed).
+- **stage-packages +=**: kea-dhcp4-server, tcpdump.
+- **python-packages +=**: psutil.
+- **special**: psutil compilation needs python3-dev, build-essential → these go in the
+  install-python part's **build-packages**.
+
+### 8.14 docker-dhcp-relay (config-engine base) — approach B
+
+- Per-VLAN dynamic relay agents. **The only approach B container.**
+- **services**: rsyslogd, start, dhcprelayd (static only; per-VLAN agents via dynamic
+  pebble layer).
+- **New file**: `pebble-layer.j2` (translates supervisord.conf.j2 to pebble layer YAML).
+- **start.sh**: existing, append pebble branch that renders `pebble-layer.j2` and
+  `pebble add` it.
+- **organize +=**: all .j2 templates → templates, start.sh.
+- **python-packages +=**: psutil, sonic_dhcp_utilities wheel.
+- **special**: docker_init.sh rendered supervisord.conf.j2 at startup; Rock path
+  replaces this with pebble-layer.j2 rendering in start.sh.
+
+### 8.15 docker-orchagent (swss-layer base)
+
+- Many daemons: orchagent, portsyncd, neighsyncd, vlanmgrd, intfmgrd, portmgrd, vrfmgrd,
+  buffermgrd, countercheck, tunnel_packet_handler, etc. (356-line supervisord.conf.j2).
+- Approach A: enumerate all, start.sh starts on-demand.
+- **docker-init.j2 rendered at build time** (`sonic-cfggen -a '{"CONFIGURED_PLATFORM":"..."}'`)
+  — Rock path: reproduce this rendering in `override-build` (or keep the rendered script).
+- **organize +=**: many .j2 templates, *.sh scripts, *.py scripts, *.conf.
+- **stage-packages +=**: swss-layer inherited + orchagent-specific.
+- **special**: tunnel_packet_handler.py (14KB), enable_counters.py, buffermgrd.sh,
+  orchagent.sh (149 lines), swssconfig.sh.
+
+### 8.16 docker-platform-monitor (config-engine base)
+
+- 14+ conditional daemons: bmcctld, chassisd, chassis_db_init, lm-sensors, fancontrol,
+  ledd, xcvrd, ycabled, psud, syseepromd, thermalctld, pcied, sensormond, stormond,
+  delay.
+- Approach A: enumerate all in services, start.sh conditionally starts.
+- **docker-pmon.supervisord.conf.j2** (314 lines) rendered at startup — no longer needed
+  for pebble path (services declared in rockcraft.yaml). But `docker_init.j2` platform
+  detection (mellanox/aspeed/bluefield, sonic_platform wheel install) must be preserved
+  in start.sh.
+- **organize +=**: delay.py, lm-sensors.sh, ssd_tools/*, etc/rsyslog.conf,
+  docker-pmon.supervisord.conf.j2 (keep for reference, rock path doesn't use).
+- **stage-packages +=**: ipmitool, librrd8t64, rrdtool, python3-smbus, dmidecode,
+  i2c-tools, psmisc, python3-netifaces, libpci3, iputils-ping, pciutils, nvme-cli,
+  ethtool, xxd, python3-bottle, smartmontools.
+- **python-packages +=**: grpcio==1.71.0, grpcio-tools==1.71.0, thrift==0.13.0, requests,
+  python-dateutil==2.9.0.post0, libpci, psutil, blkinfo, smbus2.
+- **special**: grpc `.so` strip (in `override-build`); ssd_tools/SmartCmd 2.4MB binary;
+  docker_init.j2 rendered at build time (in `override-build`).
+
+### 8.17 docker-fpm-frr (swss-layer base)
+
+- FRR routing suite: zebra, bgpd, staticd, mgmtd, bfdd, ospfd, pimd, pathd, sharpd,
+  fpmsyncd, bgpcfgd/frrcfgd, bgpmon, bfdmon, vtysh_b, bgp_eoiu_marker, zsocket, etc.
+- Approach A: enumerate all in services, start.sh conditionally starts.
+- **docker_init.sh** (130 lines) renders supervisord.conf.j2, critical_processes.j2,
+  isolate.j2, unisolate.j2, handles 4 routing config modes (separated/split/
+  split-unified/unified), modifies default gateway, creates sr0 dummy interface. Rock
+  path: most of this moves to start.sh's pebble branch.
+- **frr user/group**: create via `add-user` part's `overlay-script` with specified
+  UID/GID (frr_user_uid, frr_user_gid).
+- **organize +=**: entire frr/ template tree, docker_init.sh, snmp.conf, TS*, zsocket.sh.
+- **stage-packages +=**: logrotate, libgoogle-perftools4t64 (conditional).
+- **special**: 4 config modes, Traffic Shift scripts (TS/TSA/TSB/TSC), sr0 dummy interface.
+
+### 8.18 platform/broadcom/docker-syncd-brcm
+
+- Core daemon: syncd (SAI implementation, Broadcom SDK).
+- **services**: rsyslogd, start, syncd.
+- **organize**: Broadcom platform-specific config, SAI libraries.
+- **stage-packages**: Broadcom SDK runtime libraries.
+- **special**: requires investigation of `platform/broadcom/docker-syncd-brcm/Dockerfile.j2`
+  and `.mk` before implementation (not fully surveyed in this design).
+
+### 8.19 platform/vs/docker-syncd-vs
+
+- Core daemon: syncd (VS SAI implementation).
+- **services**: rsyslogd, start, syncd.
+- **special**: requires investigation of `platform/vs/docker-syncd-vs/` before
+  implementation. Noble's `build_rocks.sh` had it commented out, so no direct reference.
+
+## 9. Files to Create / Modify (per container)
+
+Each container migration touches:
+
+### 9.1 New files
+
+| File | Description |
+|------|-------------|
+| `<container>/rockcraft.yaml` | Rockcraft manifest (from section 5 skeleton) |
+| `<container>/pebble-layer.j2` | **Only docker-dhcp-relay**: dynamic pebble layer template |
+| `<container>/start.sh` | **Only containers without one**: docker-mux, docker-macsec, docker-sflow (create with pebble branch) |
+
+### 9.2 Modified files
+
+| File | Change |
+|------|--------|
+| `<container>/start.sh` | Append pebble detection and orchestration block (for containers with existing start.sh) |
+| `build_rocks.sh` | Append `"<container>"` to rocklist |
+
+### 9.3 Unmodified files
+
+| File | Reason |
+|------|--------|
+| `Dockerfile.j2` | Docker path unchanged (coexistence) |
+| `supervisord.conf` / `supervisord.conf.j2` | Docker path only; not used in rock |
+| `critical_processes` | Docker path only; not used in rock |
+| `rules/<container>.mk` | No change |
+| `rules/scripts.mk` | Already updated by docker-database migration |
+| `files/build_templates/docker_image_ctl.j2` | Already supports pebble detection |
+
+## 10. Verification (per container)
+
+Many containers depend on the SONiC runtime environment and configuration files (Config
+DB, platform config, shared state) that are not present on a bare machine. Verification at
+this stage covers three layers: (1) Docker path regression, (2) successful rockcraft packing
+and image loading, and (3) a limited runtime check by starting the container directly on the
+build machine. Full runtime verification (daemon functionality under a complete SONiC image)
+is deferred.
+
+### 10.1 Docker path regression
+
+```bash
+make SONIC_BUILD_JOBS=4 target/docker-<name>.gz
+```
+
+The pebble detection in `start.sh` does not affect the Docker path because
+`pgrep -x pebble` returns false in a supervisord container.
+
+### 10.2 Rock build and load
+
+```bash
+# Prerequisite: make has been run to populate target/
+./build_rocks.sh
+```
+
+Verify:
+- `target/docker-<name>.gz` is generated (rockcraft pack completes without errors)
+- `docker load -i target/docker-<name>.gz` succeeds (image loads into Docker daemon)
+
+### 10.3 Rock build error investigation
+
+If `rockcraft pack` fails, check:
+- Missing deb files: ensure `target/debs/resolute/` contains the expected SONiC debs
+- Missing wheel files: ensure `target/python-wheels/resolute/` contains the expected wheels
+- Package resolution errors: stage-packages or build-packages not available in ubuntu@26.04
+- j2 rendering errors: `j2` tool available (from jinjanator) and template/data files staged
+- Missing shared libraries at load time: check `docker load` output and add the missing
+  library to `stage-packages`
+
+### 10.4 Limited runtime verification (bare machine)
+
+After the rock builds and loads successfully, perform a limited runtime check by starting
+the container directly with `docker run` (see `dockers/docker-database/justfile` for the
+command pattern). Then check:
+
+1. **Container does not crash immediately**: `docker ps` shows the container still running
+   after a few seconds (not exited).
+2. **Pebble services status**: `docker exec <name>_rock pebble services` shows services
+   with expected states (e.g. `rsyslogd` active, `start` inactive/exited with ignore).
+3. **Pebble logs for errors**: `docker exec <name>_rock pebble logs` and
+   `docker exec <name>_rock pebble logs <service>` — look for ImportError, missing shared
+   library, or crash messages.
+
+As noted above, many containers depend on the SONiC runtime environment and configuration
+files (Config DB, platform config, shared state) that are not present on a bare machine.
+Therefore, errors observed in this step do **not** necessarily require fixing the source
+code — they may simply be missing runtime dependencies. However, if an error is
+obviously caused by a source code issue (as opposed to a missing runtime environment),
+it should be fixed. For example, if `pebble logs <service>` shows a Python traceback or a
+missing binary that should have been packaged into the rock, that is a build/packaging
+defect to fix.
+
+### 10.5 Deferred: full runtime verification
+
+Once a complete SONiC image (e.g. `target/sonic-vs.img.gz`) is built and installed, verify:
+- Container starts in the SONiC environment
+- `pgrep -x pebble`, `pgrep -x rsyslogd`, `pgrep -x <daemon>` — all running
+- `pebble logs` shows no ImportError, missing shared library, or crash errors
+- Process list matches the Dockerfile-built container
+- Key file locations match (`/usr/bin/start.sh`, container-specific binaries, config files)
