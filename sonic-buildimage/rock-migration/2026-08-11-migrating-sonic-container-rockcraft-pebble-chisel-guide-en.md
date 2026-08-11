@@ -99,8 +99,9 @@ rootfs from two sources:
 This is the key trade-off of the chisel approach: the resulting image is
 small and contains only what you want. But you are responsible for
 listing every runtime dependency that the Dockerfile got "for
-free" from the base image. Phase 5 documents the libraries that were found
-missing at runtime and had to be added.
+free" from the base image. Some packages currently lack chisel slices and
+are staged as full apt packages in a separate part; the goal is to chisel
+all of them eventually so that separate part disappears.
 
 
 ### 2.3 Coexistence principle
@@ -247,25 +248,30 @@ services:
       DISTRO: "resolute"
 ```
 
-- **`rsyslogd`** runs in the foreground (`-n`, `-iNONE`) and starts on boot.
-- **`init`** runs `docker-database-init.sh`. It sets up the syslog pebble
-  layer, renders `database_config.json`, then issues `pebble start redis`
-  and `pebble start flushdb`. `on-success: ignore` means pebble won't
-  restart it after it exits — init is a one-shot.
-- **`redis`** is the single static Redis instance. The `bash -c` preamble
-  cleans a stale `dump.rdb` and ensures the data dir exists before exec'ing
-  `redis-server`.
-- **`flushdb`** sleeps 300s then runs `flush_unused_database`. Both
-  `on-success` and `on-failure` are ignored — best-effort cleanup.
-- `DISTRO: "resolute"` and `IMAGENAME` are environment variables SONiC
-  scripts (e.g. `container_startup.py`) read at runtime.
+These services are ported from `supervisord.conf.j2`. The changes made:
 
-### 4.2 The two `parts` — why split, and what goes where
+- Each supervisord `program` becomes a pebble `service` with `override:
+  replace`.
+- **`rsyslogd`** and **`init`** get `startup: enabled` so they auto-start
+  with the container. **`redis`** and **`flushdb`** do not — `init` starts
+  them explicitly via `pebble start` after rendering `database_config.json`.
+- **`init`** gets `on-success: ignore` so pebble doesn't restart it after
+  the one-shot exits. **`flushdb`** gets both `on-success` and `on-failure`
+  ignored (best-effort cleanup).
+- Each service gets `environment` with `IMAGENAME`, `DISTRO`, and
+  `DEBIAN_FRONTEND` — these were build-time `ENV` in the Dockerfile; pebble
+  services need them set explicitly.
+- The `redis` command gains a `bash -c` preamble that cleans a stale
+  `dump.rdb` and ensures the data dir exists before exec'ing `redis-server`.
+  Under supervisord this was handled by the init script.
+
+### 4.2 The `parts` — what goes where
 
 Rockcraft forbids mixing chisel slices and full packages in the same
-`stage-packages` list, so the manifest has two parts:
+`stage-packages` list, so packages without chisel slices go in a separate
+part for now:
 
-#### 4.2.1 `install-unchiselled-packages` — full packages
+#### 4.2.1 `install-unchiselled-packages` — full packages (temporary)
 
 ```yaml
 parts:
@@ -280,10 +286,15 @@ parts:
 ```
 
 `plugin: nil` just stages packages without building anything. These are
-packages for which no chisel slice exists or a full package is simpler.
-`libpython3.14`, `libboost-serialization1.83.0`, and `libxxhash0` were
-discovered at runtime (Phase 5) as missing shared libraries and added here;
-the full Ubuntu base image in the Dockerfile path provided them transitively.
+packages for which no chisel slice exists yet. `libpython3.14`,
+`libboost-serialization1.83.0`, and `libxxhash0` were discovered as missing
+shared libraries at runtime — the full Ubuntu base image in the Dockerfile
+path provided them transitively.
+
+This part is temporary. The goal is to chisel all of these packages and
+move their slices into the `stage-packages` list of the `setup-database`
+part (section 4.2.4), so `install-unchiselled-packages` disappears
+entirely.
 
 #### 4.2.2 `setup-database` — chisel slices + dump plugin + override-build
 
@@ -335,9 +346,6 @@ the full Ubuntu base image in the Dockerfile path provided them transitively.
   `${CRAFT_PART_INSTALL}`. This is why packages that need a postinst to
   create users (like `redis-server`) must come through a chisel slice that
   includes the user metadata, not through `dpkg -x`.
-- **deb filenames are hardcoded with versions.** When a SONiC package
-  version changes, the filename in `rockcraft.yaml` must be updated. Using
-  globs (`debs/socat_*.deb`) would avoid this but is not done here.
 - **pip wheels install to `usr/lib/python3.14/dist-packages/`** (Resolute
   uses Python 3.14). The `-t` flag targets that directory explicitly.
   `jinjanator`, `click`, `pyangbind`, `lxml` are pulled from PyPI by the
@@ -365,11 +373,7 @@ the full Ubuntu base image in the Dockerfile path provided them transitively.
 `organize` is Rockcraft's file-relocation mechanism: after `dump` places
 files at their source-relative paths, `organize` moves them to their final
 on-disk paths inside the rock. Paths must match what SONiC scripts expect at
-runtime (e.g. `/usr/share/sonic/templates/`, `/usr/local/bin/`).
-
-The `files/` directory is staged by `build_rocks.sh` (copied from
-`target/files/resolute/`), so `syslog-layer.yaml` arrives via the shared
-`files/rsyslog/syslog-layer.yaml` registered in `SONIC_COPY_FILES`.
+runtime.
 
 #### 4.2.4 `stage` and `stage-packages` (chisel slices)
 
@@ -473,10 +477,8 @@ primed rootfs.
 ## 5. Phase 3 — Adapt the Init Script for Coexistence
 
 The existing `docker-database-init.sh` is modified in-place rather than
-duplicated into a separate `rock-database-init.sh`. A separate file would
-duplicate ~150 lines of Resolute-specific logic (BMP_DB_PORT, multi-database
-detection, jinjanate rendering, chassisdb branch) and the two copies would
-drift. Instead, a single boolean branch at the top diverges only at the
+duplicated into a separate `rock-database-init.sh`. 
+A single boolean branch at the top diverges only at the
 three points where supervisord and pebble actually differ.
 
 ### 5.1 The detection preamble
@@ -581,13 +583,6 @@ fi
   rendered. This ordering is critical: the config must exist before redis
   starts.
 
-### 5.3 What is *not* changed
-
-The `mkdir -p /etc/supervisor/conf.d/` line is left in the script even on
-the pebble path (it's harmless — an empty dir). Keep the diff small and the
-supervisord path provably unaffected. Resist the urge to "clean up"
-harmless supervisord lines; the goal is a minimal, backward-compatible change.
-
 ---
 
 ## 6. Phase 4 — Wire the Build System
@@ -611,13 +606,8 @@ appended to `SONIC_COPY_FILES`:
 
 - The `ifeq ($(BLDENV), resolute)` guard ensures these variables only exist
   for the Resolute build environment.
-- `SONIC_COPY_FILES` is the master list of files the build system stages
-  into `target/files/<env>/`. By registering `rsyslog.conf` and
-  `syslog-layer.yaml` here, `build_rocks.sh`'s `cp -r target/files/resolute/*
-  $rockitem/files/` picks them up automatically.
 - `$(RSYSLOG_CONF)_PATH` points to the *existing* `rsyslog.conf` (the SONiC
   custom config with omrelp forwarding) — no new file is created for it.
-  Only `syslog-layer.yaml` is new.
 
 ### 6.2 `rules/scripts.dep` — disable caching
 
@@ -652,8 +642,8 @@ log-targets:
 This is a Pebble *log-targets* layer: it tells pebble to forward all
 services' logs via syslog to `udp://127.0.0.1:514/` (the host's rsyslog,
 which the SONiC host config listens on). It is loaded at init time by
-`pebble add syslog-layer --combine` (Phase 3). It is shared by all rock
-containers, not per-container.
+`pebble add syslog-layer --combine` (Phase 3). This file is shared by all rock
+containers.
 
 ### 6.5 `files/build_templates/docker_image_ctl.j2` — readiness checks
 
@@ -725,8 +715,7 @@ Walkthrough:
 3. **`rockcraft clean` + `rockcraft pack`** builds the `.rock` OCI archive.
 4. **`rockcraft.skopeo copy`** converts the `.rock` into a Docker daemon
    image tagged `<rockname>:latest`. `--insecure-policy` is needed because
-   the default skopeo policy doesn't know about rocks. Use
-   `rockcraft.skopeo`, not bare `skopeo` — Rockcraft ships a patched copy.
+   the default skopeo policy doesn't know about rocks.
 5. **Cleanup** the staged `debs/files/python-wheels/envs` and the `.rock`
    (they're regenerated each run).
 6. **`docker save | pigz`** produces `target/<rockname>.gz` — the same
@@ -734,10 +723,11 @@ Walkthrough:
 7. **`docker rmi -f`** removes the local image to keep the daemon clean.
 
 `build_rocks.sh` runs on the host after `make`, not integrated into the
-Makefile graph. Rockcraft needs LXD and runs on the host, but `make` builds
-inside a `sonic-slave-*` container that doesn't have LXD/rockcraft.
+Makefile graph. `make` builds
+inside a `sonic-slave-resolute` container that doesn't have rockcraft.
 Integrating rockcraft into the Makefile graph would require restructuring
-the slave container, so the build is a manual two-step: `make ... && ./build_rocks.sh`.
+the slave container, so we keep the build process a manual two-step: 
+`make ... && ./build_rocks.sh`.
 
 ### 6.7 `.gitignore` — rockcraft build artifacts
 
@@ -748,14 +738,6 @@ dockers/*/files/
 dockers/*/python-wheels/
 dockers/*/envs
 dockers/*/*.rock
-
-# Installer-related files and directories
-installer/x86_64/platforms/
-installer/platforms/
-
-# Misc. files
-*service
-justfile
 ```
 The `dockers/*/` patterns cover the staged `debs/`, `files/`,
 `python-wheels/`, `envs` and the built `.rock` for every container dir, so
@@ -775,41 +757,25 @@ make SONIC_BUILD_JOBS=4 target/sonic-vs.img.gz
 
 # 2. Build rocks (host-side, needs LXD + rockcraft + docker)
 ./build_rocks.sh
+
+# 3. Re-run make to package the rock container images into the final
+#    sonic-vs.img.gz
+make SONIC_BUILD_JOBS=4 target/sonic-vs.img.gz
 ```
-`build_rocks.sh` produces `target/docker-database.gz`.
+`build_rocks.sh` produces `target/docker-database.gz`. The final re-make
+packages it (and any other rock container images) into the SONiC image.
 
 ### 7.2 Verification checklist
 
 1. `make target/sonic-vs.img.gz` still succeeds — the Dockerfile path is
    unmodified.
 2. `build_rocks.sh` completes and `target/docker-database.gz` exists.
-3. Load the image and start the container; `redis-cli PING` returns `PONG`.
-4. `pebble logs` (or `docker logs`) shows no `ImportError` or
+3. The final re-make packages the rock image into `sonic-vs.img.gz`.
+4. Load the image and start the container; `redis-cli PING` returns `PONG`.
+5. `pebble logs` (or `docker logs`) shows no `ImportError` or
    `error while loading shared libraries` messages.
-5. `docker_image_ctl.j2` correctly detects the pebble-based container
+6. `docker_image_ctl.j2` correctly detects the pebble-based container
    (the readiness wait completes).
-
-### 7.3 Runtime dependencies discovered during testing
-
-These were not in the Phase 1 map because the full Ubuntu base image
-provided them transitively. They were found missing at runtime and added to
-`install-unchiselled-packages`:
-
-| Package | Provides | Needed by |
-|---|---|---|
-| `libpython3.14` | `libpython3.14.so.1.0` | swsscommon Python bindings |
-| `libboost-serialization1.83.0` | `libboost_serialization.so` | libswsscommon |
-| `libxxhash0` | `libxxhash.so` | libyang3 |
-
-**How to discover these for your container:** build the rock, start it,
-run the container's main binary, and watch for `error while loading shared
-libraries: libX.so.Y: cannot open shared object file`. Then `apt-file
-search libX.so.Y` on a Resolute system to find the package, and add it to
-`install-unchiselled-packages`. Iterate until clean.
-
-Note: `libpython3.14-stdlib` and `libpython3.14-minimal` are not listed as
-separate full packages — the `python3.14_standard` chisel slice covers the
-stdlib, and `libpython3.14` covers the shared library.
 
 ---
 
@@ -831,8 +797,9 @@ Apply this to your own container. Each item maps to a phase above.
 - [ ] Define pebble `services`: rsyslogd (startup: enabled), your init
       (startup: enabled, on-success: ignore), your daemons (started by
       init after config render).
-- [ ] Split parts: full packages in one `plugin: nil` part; chisel slices
-      + `dpkg -x` + `pip3 install` in a `plugin: dump` part.
+- [ ] Put packages without chisel slices in a `plugin: nil` part (temporary);
+      everything else in a `plugin: dump` part with chisel slices +
+      `dpkg -x` + `pip3 install`.
 - [ ] `organize` every file to its runtime path.
 - [ ] `override-prime`: symlinks (python3, awk), rsyslog.conf copy (not in
       organize!), any Dockerfile `sed` reproduction, manifest copy.
@@ -860,6 +827,7 @@ Apply this to your own container. Each item maps to a phase above.
 **Build & verify (Phase 5):**
 - [ ] `make target/sonic-vs.img.gz` still passes.
 - [ ] `./build_rocks.sh` produces `target/<your-container>.gz`.
+- [ ] Re-run `make target/sonic-vs.img.gz` to package the rock image in.
 - [ ] Container starts; main daemon responds; no missing-library errors.
 - [ ] `docker_image_ctl.j2` readiness wait completes for your container.
 
