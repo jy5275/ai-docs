@@ -3,10 +3,6 @@
 **A docker-database Case Study on Ubuntu Resolute (26.04)**
 
 **Date:** 2026-08-11
-**Source branch:** `202605_resolute_rock`
-**Reference commits:**
-- `6853735e9` — build: add rockcraft build infrastructure and pebble/supervisord coexistence
-- `d319c706f` — build: migrate docker-database to rockcraft+pebble
 
 ---
 
@@ -17,7 +13,7 @@
 This is a hands-on migration guide. It walks through the `docker-database`
 container's migration from a Dockerfile + supervisord packaging to a Rockcraft
 manifest + Pebble services + Chisel slices rock, step by step, using the real
-files committed on the `202605_resolute_rock` branch as the worked example.
+source files in the `sonic-buildimage` tree as the worked example.
 
 The goal is not to document docker-database itself, but to teach the
 **method** so you can apply it to your own SONiC container.
@@ -35,48 +31,23 @@ Software and network engineers who:
   which file goes where, which Make variables to touch, what breaks at
   runtime.
 
-### 1.3 The two commits and what they split
+### 1.3 The two layers of change
 
-The migration was delivered as two commits that together establish the
-pattern every later container migration on this branch follows:
+The migration consists of two layers of work that together establish the
+pattern every later container migration follows:
 
-| Commit | Scope | Files touched |
-|--------|-------|---------------|
-| `6853735e9` | **Build infrastructure** — shared plumbing that all rock containers reuse | `files/rsyslog/syslog-layer.yaml` (new), `rules/scripts.mk`, `rules/scripts.dep`, `rules/docker-config-engine-resolute.mk`, `files/build_templates/docker_image_ctl.j2`, `.gitignore` |
-| `d319c706f` | **docker-database itself** — the container-specific rock | `dockers/docker-database/rockcraft.yaml` (new), `dockers/docker-database/docker-database-init.sh` (modified), `build_rocks.sh` (new) |
+| Layer | Scope | Files touched |
+|-------|-------|---------------|
+| **Build infrastructure** (shared plumbing reusable by all rock containers) | Common files that every rock container needs | `files/rsyslog/syslog-layer.yaml` (new), `rules/scripts.mk`, `rules/scripts.dep`, `rules/docker-config-engine-resolute.mk`, `files/build_templates/docker_image_ctl.j2`, `.gitignore` |
+| **docker-database itself** (the container-specific rock) | The per-container rock manifest, init script, and build script | `dockers/docker-database/rockcraft.yaml` (new), `dockers/docker-database/docker-database-init.sh` (modified), `build_rocks.sh` (new) |
 
-The split is intentional: commit 1 is reusable by every subsequent container;
-commit 2 is the per-container work. When you migrate your own container you
-will mostly produce a commit that looks like commit 2, and only touch the
-commit-1 plumbing if your container needs a *new* shared file.
+The split is intentional: the infrastructure layer is reusable by every
+subsequent container; the docker-database layer is the per-container work.
+When you migrate your own container you will mostly produce changes that look
+like the second layer, and only touch the infrastructure layer if your
+container needs a *new* shared file.
 
-### 1.4 Note on prior AI-generated design docs
-
-Two AI-generated documents (`2026-07-16-rockcraft-pebble-docker-database-resolute-design-en.md`
-and its plan sibling) were produced *before* the implementation. The actual
-committed code diverges from them in several places. Where they conflict,
-**this guide follows the source code**. The most important divergences:
-
-1. **Unified init script, not a copy.** The design doc proposed a separate
-   `rock-database-init.sh`. The code instead modified the *existing*
-   `docker-database-init.sh` with a `USE_PEBBLE` flag so one script serves
-   both the Dockerfile and the Rockcraft path. (See Phase 3.)
-2. **No `SUPERVISOR_PROC_EXIT_LISTENER_SCRIPT`.** The plan added this
-   variable to `rules/scripts.mk`; it was never committed. Only
-   `RSYSLOG_CONF` and `RSYSLOG_PEBBLE_LAYER` were added.
-3. **Stage-packages contents.** The design doc listed
-   `libpython3.14-stdlib` / `libpython3.14-minimal` as separate full
-   packages; the code puts only `libpython3.14` (plus
-   `libboost-serialization1.83.0`, `libxxhash0`) in the full-package part,
-   and relies on the `python3.14_standard` chisel slice for the stdlib.
-4. **No manual `redis` user creation in `override-prime`.** The design doc
-   described `echo 'redis:x:999...'` lines; the committed `override-prime`
-   does not contain them. The `redis` user/group come from the
-   `redis-server_bins` chisel slice.
-
-Keep these in mind if you cross-reference the earlier docs.
-
-### 1.5 Scope of the docker-database migration
+### 1.4 Scope of the docker-database migration
 
 - **VS / single-ASIC only.** The rock starts a single static Redis instance.
   Multi-ASIC and VoQ chassis dynamic-instance generation (which the
@@ -138,8 +109,8 @@ listing every transitive runtime dependency that the Dockerfile got "for
 free" from the base image. Phase 5 documents the libraries that were found
 missing at runtime and had to be added.
 
-> **Why not `base: ubuntu@26.04`?** Later container migrations on this
-> branch (docker-eventd, docker-router-advertiser, docker-sonic-mgmt-framework)
+> **Why not `base: ubuntu@26.04`?** Later container migrations
+> (docker-eventd, docker-router-advertiser, docker-sonic-mgmt-framework)
 > adopted the simpler full-base approach. This guide covers the chisel
 > approach used by docker-database, which was the pioneering migration.
 > If your container has a large runtime footprint and image size is not a
@@ -202,8 +173,8 @@ Then classify each item:
 
 ### 3.2 The resulting map (docker-database)
 
-Here is the flattened map that produced the committed `rockcraft.yaml`.
-Use this as a template for your own container's analysis.
+Here is the flattened map that produced the `rockcraft.yaml` in the source
+tree. Use this as a template for your own container's analysis.
 
 | Source layer | Item | Classification | Rockcraft landing |
 |---|---|---|---|
@@ -248,7 +219,7 @@ is declared.
 ## 4. Phase 2 — Author `rockcraft.yaml`
 
 With the map from Phase 1, write `dockers/docker-database/rockcraft.yaml`.
-This is the committed file in its entirety; the subsections explain each
+This is the source file in its entirety; the subsections explain each
 block's rationale.
 
 ### 4.1 Header & services
@@ -399,7 +370,7 @@ Key points:
   maintenance cost: when a SONiC package version changes, the filename in
   `rockcraft.yaml` must be updated. (Later migrations mitigate this with
   glob patterns like `debs/socat_*.deb` — see docker-eventd's `rockcraft.yaml`
-  for the pattern. The docker-database commit predates that improvement.)
+  for the pattern. The docker-database rock predates that improvement.)
 - **pip wheels install to `usr/lib/python3.14/dist-packages/`** (Resolute
   uses Python 3.14; Noble used 3.12). The `-t` flag targets that directory
   explicitly. `jinjanator`, `click`, `pyangbind`, `lxml` are pulled from PyPI
@@ -511,7 +482,7 @@ arrives via the shared `files/rsyslog/syslog-layer.yaml` registered in
 ```
 
 `override-prime` runs after `stage` and is the last chance to mutate the
-primed rootfs. The committed fixups:
+primed rootfs. The fixups in the source:
 
 - **Symlinks** `awk`→`gawk` and `python3`→`python3.14`. With `base: bare`
   these symlinks don't exist until you create them.
@@ -548,15 +519,15 @@ primed rootfs. The committed fixups:
 
 The biggest decision in this migration: **modify the existing
 `docker-database-init.sh` rather than create a `rock-database-init.sh`.**
-The AI design doc proposed a separate file; the commit chose a unified
-script. Here's why and how.
+A separate file would mean duplicating logic; the source instead chose a
+unified script. Here's why and how.
 
 ### 5.1 Why a unified script
 
 A separate `rock-database-init.sh` would duplicate ~150 lines of
 Resolute-specific logic (BMP_DB_PORT, multi-database detection, jinjanate
 rendering, chassisdb branch) and the two copies would drift. Instead, the
-committed approach adds a single boolean branch at the top and only
+source adds a single boolean branch at the top and only
 diverges at the three points where supervisord and pebble actually differ.
 
 ### 5.2 The detection preamble
@@ -678,8 +649,8 @@ backward-compatible* change.
 
 ## 6. Phase 4 — Wire the Build System
 
-This phase corresponds to commit `6853735e9`. These are the shared changes
-that every rock container benefits from.
+This phase covers the shared build-system changes that every rock container
+benefits from.
 
 ### 6.1 `rules/scripts.mk` — register shared files
 
@@ -810,15 +781,15 @@ do
     docker rmi -f $rockname:latest
 done
 ```
-(shown in its current state; the docker-database commit had only the
-single `dockers/docker-database` entry in `rocklist`.)
+(shown in its current state; when docker-database was first migrated, the
+`rocklist` had only the single `dockers/docker-database` entry.)
 
 Walkthrough:
 
 1. **Stage build artifacts** into each container's `debs/`, `files/`,
    `python-wheels/` dirs. These are the dirs `rockcraft.yaml`'s `source: .`
    picks up. They are gitignored (next section).
-2. **Generate `envs`** with `IMAGE_VERSION` = branch-commit. This is the
+2. **Generate `envs`** with `IMAGE_VERSION` = branch name + commit hash. This is the
    file `docker-database-init.sh` sources in the pebble preamble.
 3. **`rockcraft clean` + `rockcraft pack`** builds the `.rock` OCI archive.
 4. **`rockcraft.skopeo copy`** converts the `.rock` into a Docker daemon
@@ -908,11 +879,11 @@ libraries: libX.so.Y: cannot open shared object file`. Then `apt-file
 search libX.so.Y` on a Resolute system to find the package, and add it to
 `install-unchiselled-packages`. Iterate until clean.
 
-> **Note:** the AI design doc also listed `libpython3.14-stdlib` and
-> `libpython3.14-minimal` as separate full packages here. The committed code
-> does **not** include them — the `python3.14_standard` chisel slice covers
-> the stdlib, and `libpython3.14` covers the shared library. Follow the
-> code.
+> **Note:** you might expect `libpython3.14-stdlib` and
+> `libpython3.14-minimal` to be listed as separate full packages here. The
+> source does **not** include them — the `python3.14_standard` chisel slice
+> covers the stdlib, and `libpython3.14` covers the shared library. Follow
+> the code.
 
 ---
 
@@ -1015,8 +986,8 @@ Under supervisord, redis runs as the `redis` user, so the init script
 the `redis` service runs as root and those chowns are skipped. The `redis`
 user/group themselves come from the `redis-server_bins` (and
 `base-passwd_data`) chisel slices, *not* from a manual `echo` in
-`override-prime`. (The AI design doc claimed manual `echo` lines exist; they
-do not in the committed code.) If your container runs a daemon as a
+`override-prime`. (You might see references to manual `echo 'redis:x:999...'`
+lines; they do not exist in the source.) If your container runs a daemon as a
 non-root user, verify the user comes from a slice before relying on it.
 
 ### 9.6 `rsyslog.conf` copy timing
@@ -1057,22 +1028,22 @@ out of scope for this migration.
 
 ### New files
 
-| Path | Purpose | Commit |
-|---|---|---|
-| `dockers/docker-database/rockcraft.yaml` | The rock manifest (Phase 2) | `d319c706f` |
-| `files/rsyslog/syslog-layer.yaml` | Shared pebble syslog layer (Phase 4.4) | `6853735e9` |
-| `build_rocks.sh` | Standalone rock build orchestrator (Phase 4.6) | `d319c706f` |
+| Path | Purpose |
+|---|---|
+| `dockers/docker-database/rockcraft.yaml` | The rock manifest (Phase 2) |
+| `files/rsyslog/syslog-layer.yaml` | Shared pebble syslog layer (Phase 4.4) |
+| `build_rocks.sh` | Standalone rock build orchestrator (Phase 4.6) |
 
 ### Modified files
 
-| Path | Change | Commit |
-|---|---|---|
-| `dockers/docker-database/docker-database-init.sh` | `USE_PEBBLE` branch (Phase 3) | `d319c706f` |
-| `rules/scripts.mk` | `RSYSLOG_CONF`, `RSYSLOG_PEBBLE_LAYER` vars + `SONIC_COPY_FILES` (Phase 4.1) | `6853735e9` |
-| `rules/scripts.dep` | `CACHE_MODE=none` for the two new files (Phase 4.2) | `6853735e9` |
-| `rules/docker-config-engine-resolute.mk` | Add the two files to `_FILES` (Phase 4.3) | `6853735e9` |
-| `files/build_templates/docker_image_ctl.j2` | pebble OR supervisord readiness (Phase 4.5) | `6853735e9` |
-| `.gitignore` | rockcraft build artifacts (Phase 4.7) | `6853735e9` |
+| Path | Change |
+|---|---|
+| `dockers/docker-database/docker-database-init.sh` | `USE_PEBBLE` branch (Phase 3) |
+| `rules/scripts.mk` | `RSYSLOG_CONF`, `RSYSLOG_PEBBLE_LAYER` vars + `SONIC_COPY_FILES` (Phase 4.1) |
+| `rules/scripts.dep` | `CACHE_MODE=none` for the two new files (Phase 4.2) |
+| `rules/docker-config-engine-resolute.mk` | Add the two files to `_FILES` (Phase 4.3) |
+| `files/build_templates/docker_image_ctl.j2` | pebble OR supervisord readiness (Phase 4.5) |
+| `.gitignore` | rockcraft build artifacts (Phase 4.7) |
 
 ### Untouched (coexistence)
 
@@ -1085,7 +1056,5 @@ out of scope for this migration.
 
 ---
 
-*End of guide. Cross-reference the two reference commits (`6853735e9`,
-`d319c706f`) and the committed source files for any detail this guide
-summarizes. Where this guide and the earlier AI-generated design documents
-disagree, the source code is authoritative.*
+*End of guide. Cross-reference the source files in the `sonic-buildimage`
+tree for any detail this guide summarizes; the source code is authoritative.*
