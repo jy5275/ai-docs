@@ -779,63 +779,9 @@ packages it (and any other rock container images) into the SONiC image.
 
 ---
 
-## 8. Reusable Migration Checklist
+## 8. Pitfalls and Resolute-specific Notes
 
-Apply this to your own container. Each item maps to a phase above.
-
-**Analysis (Phase 1):**
-- [ ] Identify your container's Docker layer chain (parent → ... → yours).
-- [ ] For each layer, read its `Dockerfile.j2` *and* its `rules/*.mk`
-      (`_DEPENDENT_PACKAGES`, `_PYTHON_WHEELS`, `_FILES`).
-- [ ] Build the 4-category × classification table (apt / pip / SONiC-debs /
-      files; needed / drop-supervisord / drop-build-only / dedup).
-- [ ] Resolve every row to a rockcraft landing (part, slice, dpkg -x, pip,
-      organize, or override-prime).
-
-**rockcraft.yaml (Phase 2):**
-- [ ] Use `base: bare` + `build-base: ubuntu@26.04` (chiselled rock).
-- [ ] Define pebble `services`: rsyslogd (startup: enabled), your init
-      (startup: enabled, on-success: ignore), your daemons (started by
-      init after config render).
-- [ ] Put packages without chisel slices in a `plugin: nil` part (temporary);
-      everything else in a `plugin: dump` part with chisel slices +
-      `dpkg -x` + `pip3 install`.
-- [ ] `organize` every file to its runtime path.
-- [ ] `override-prime`: symlinks (python3, awk), rsyslog.conf copy (not in
-      organize!), any Dockerfile `sed` reproduction, manifest copy.
-- [ ] Verify YAML: `python3 -c "import yaml; yaml.safe_load(open('rockcraft.yaml'))"`.
-
-**Init script (Phase 3):**
-- [ ] Add the `USE_PEBBLE` detection preamble (pgrep, source envs, syslog
-      layer add+replan).
-- [ ] Guard each supervisord-specific block with `if [[ "$USE_PEBBLE" != "true" ]]`.
-- [ ] Replace `exec supervisord` with `pebble start <services>` under pebble.
-- [ ] Verify: `grep supervisord` still shows the supervisord path is intact;
-      `grep pebble` shows the new path. Run `bash -n` for syntax.
-
-**Build system (Phase 4):**
-- [ ] If your container needs a *new* shared file, add it to
-      `rules/scripts.mk` (guarded by `ifeq ($(BLDENV), resolute)`), append
-      to `SONIC_COPY_FILES`, add `CACHE_MODE=none` in `rules/scripts.dep`,
-      and add to the relevant `rules/<container>.mk` `_FILES`.
-- [ ] Add your container to `build_rocks.sh`'s `rocklist`.
-- [ ] Update every `docker_image_ctl.j2` readiness block that names your
-      container to accept pebble OR supervisord.
-- [ ] Confirm `.gitignore` patterns already cover your container's
-      `debs/files/python-wheels/envs/*.rock` (they do, via `dockers/*/`).
-
-**Build & verify (Phase 5):**
-- [ ] `make target/sonic-vs.img.gz` still passes.
-- [ ] `./build_rocks.sh` produces `target/<your-container>.gz`.
-- [ ] Re-run `make target/sonic-vs.img.gz` to package the rock image in.
-- [ ] Container starts; main daemon responds; no missing-library errors.
-- [ ] `docker_image_ctl.j2` readiness wait completes for your container.
-
----
-
-## 9. Pitfalls and Resolute-specific Notes
-
-### 9.1 Python 3.14 paths
+### 8.1 Python 3.14 paths
 
 Resolute ships Python 3.14 (Noble had 3.12). Every Python path in
 `rockcraft.yaml` must use `python3.14` and `usr/lib/python3.14/dist-packages/`:
@@ -845,7 +791,7 @@ the `pip3 install -t` target, the `python3.14_standard` slice, the
 Getting any of these wrong produces a rock where `python3` is missing or
 wheels are installed to a path Python doesn't search.
 
-### 9.2 `jinjanate` vs `j2`
+### 8.2 `jinjanate` vs `j2`
 
 Resolute uses `jinjanate` (the `jinjanator` pip package) for template
 rendering, not the `j2` command (the `j2cli` package) used on Noble. The
@@ -853,7 +799,7 @@ init script calls `jinjanate /usr/share/sonic/templates/...j2`. Ensure
 `jinjanator` is in your pip install list. Check what your container's
 scripts actually invoke.
 
-### 9.3 rsyslog: omrelp, not omfwd
+### 8.3 rsyslog: omrelp, not omfwd
 
 Resolute's `rsyslog.conf` uses the `omrelp` output module (TCP 2514,
 reliable delivery) rather than Noble's `omfwd` (UDP 514). This is why
@@ -863,13 +809,13 @@ reliable delivery) rather than Noble's `omfwd` (UDP 514). This is why
 host via omrelp. Don't "fix" the UDP location to TCP — it's intentionally
 the local hop.
 
-### 9.4 Hardcoded deb filenames
+### 8.4 Hardcoded deb filenames
 
 The `dpkg -x debs/libyang3_3.13.6-1ubuntu0.1_amd64.deb ...` lines embed
 versions. When a SONiC package version bumps, the rock build breaks until
 you update the filename. Using globs (`debs/libyang3_*.deb`) avoids this.
 
-### 9.5 The `redis` user and `chown -R redis:redis`
+### 8.5 The `redis` user and `chown -R redis:redis`
 
 Under supervisord, redis runs as the `redis` user, so the init script
 `chown -R redis:redis` the data dirs. Under pebble in the chiselled rock,
@@ -879,7 +825,7 @@ user/group themselves come from the `redis-server_bins` (and
 `override-prime`. If your container runs a daemon as a non-root user,
 verify the user comes from a slice before relying on it.
 
-### 9.6 `rsyslog.conf` copy timing
+### 8.6 `rsyslog.conf` copy timing
 
 As explained in Phase 2, `rsyslog.conf` must be copied in `override-prime`,
 not `organize` — the `rsyslog` stage-package's own `/etc/rsyslog.conf`
@@ -887,7 +833,7 @@ overwrites it during staging. The general rule: put any file that conflicts
 with a stage-package's file in `override-prime`. The symptom of getting this
 wrong is "my rsyslog config is ignored."
 
-### 9.7 Multi-ASIC / VoQ scope
+### 8.7 Multi-ASIC / VoQ scope
 
 The docker-database rock's static pebble services only start one Redis
 instance. The Dockerfile path, by rendering `supervisord.conf.j2` per
@@ -897,13 +843,13 @@ generate a pebble layer per instance and `pebble add` + `pebble replan`.
 That is a fundamentally different architecture from the static services
 defined in `rockcraft.yaml`, and is future work beyond this case study.
 
-### 9.8 `rockcraft.skopeo`, not `skopeo`
+### 8.8 `rockcraft.skopeo`, not `skopeo`
 
 Use the `rockcraft.skopeo` binary shipped with the rockcraft snap. Bare
 `skopeo` may lack the policy support for `.rock` OCI archives. The
 `--insecure-policy` flag is required.
 
-### 9.9 Build graph integration is intentionally absent
+### 8.9 Build graph integration is intentionally absent
 
 `build_rocks.sh` runs on the host after `make`. Folding rockcraft into
 `slave.mk` / `rules/*.mk` would require reworking the `sonic-slave`
@@ -911,7 +857,7 @@ container to include LXD and rockcraft — a separate, larger effort.
 
 ---
 
-## 10. Appendix — File Inventory
+## 9. Appendix — File Inventory
 
 ### New files
 
