@@ -249,6 +249,32 @@ parts:
   `setup-<name>` part installs all debs via `dpkg -x` and places files via `organize`.
   This is more concise and more declarative.
 
+### 5.2 Authoring principles
+
+- **Keep it lean.** `rockcraft.yaml` should be as minimal as possible. The
+  `feature_noble_build` branch's rockcraft.yaml files may contain redundant commands or
+  entries carried over from earlier migrations. For every line in a `rockcraft.yaml`, be
+  able to trace its necessity back to a concrete source in the current branch — typically
+  `Dockerfile.j2`, `rules/*.mk`, or other files in the same container directory. If no
+  such basis exists, the line is a candidate for removal.
+- **Verify by removal, not by packing.** When an element is suspected to be unnecessary,
+  remove it and test whether the rock still builds and runs. `rockcraft pack` runs the
+  entire lifecycle (pull → overlay → build → stage → prime) plus OCI layer creation in one
+  shot, which is slow for iterative testing. If the removed element only affects a specific
+  lifecycle step, use the corresponding subcommand to inspect the intermediate state instead
+  of packing the final artifact every time:
+
+  | Command | Stops after | Inspect directory |
+  |---------|-------------|-------------------|
+  | `rockcraft build` | BUILD | `${CRAFT_PART_INSTALL}` |
+  | `rockcraft stage` | STAGE | `${CRAFT_STAGE}` |
+  | `rockcraft prime` | PRIME | `${CRAFT_PRIME}` |
+  | `rockcraft prime --shell-after` | PRIME | drops into a shell in `${CRAFT_PRIME}` |
+
+  This avoids waiting for the full `pack` cycle on every iteration. Reserve
+  `rockcraft pack` (and the subsequent `docker load` / runtime check) for the final
+  confirmation that the rock is correct and runnable.
+
 ## 6. start.sh Universal Pattern
 
 Every container's `start.sh` follows this structure:

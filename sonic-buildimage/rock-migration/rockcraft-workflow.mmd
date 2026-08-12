@@ -1,0 +1,26 @@
+graph LR
+    %% Part aa
+    in_a[empty dir] -- "a:pull" --> aa_src["parts/aa/src/"]
+    aa_src --> aa_build["parts/aa/build/"]
+    aa_build -- "a:build" --> aa_build
+    aa_build --> aa_install["parts/aa/install/"]
+    aa_install -- "a:stage" --> stage["stage/"]
+
+    %% Part bb
+    in_b[empty dir] -- "b:pull" --> bb_src["parts/bb/src/"]
+    bb_src --> bb_build["parts/bb/build/"]
+    bb_build -- "b:build" --> bb_build
+    bb_install["parts/bb/install/"]
+    bb_build --> bb_install
+    bb_install -- "b:stage" --> stage
+
+    %% Part cc
+    in_c[empty dir] -- "c:pull" --> cc_src["parts/cc/src/"]
+    cc_src --> cc_build["parts/cc/build/"]
+    cc_build -- "c:build" --> cc_build
+    cc_install["parts/cc/install/"]
+    cc_build --> cc_install
+    cc_install -- "c:stage" --> stage
+
+    %% Final step
+    stage -- "prime" --> prime["prime/"]

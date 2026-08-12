@@ -169,17 +169,17 @@ tree. Use this as a template for your own container's analysis.
 | L1 base | `etc/rsyslog.d/supervisor.conf`, `etc/supervisor/...` | drop (supervisord) | — |
 | L1 base | `pip.conf`, `sources.list` | drop (no apt in `base: bare`) | — |
 | L2 config-engine | `python3-redis`, `python3-yaml` | needed | (covered by `python3.14_standard` slice + pip wheels) |
-| L2 config-engine | `pyangbind==0.8.7` | needed | `pip3 install` in `override-build` |
+| L2 config-engine | `pyangbind==0.8.7` | needed | `install-python` part (`python` plugin) |
 | L2 config-engine | `build-essential`, `python3-dev`, `apt-utils`, `python3-cffi` | drop (build-only / unused at runtime) | — |
 | L2 config-engine | `libswsscommon`, `libyang3`, `python3-libyang`, `python3-swsscommon`, `sonic-db-cli`, `sonic-eventd` (SONiC debs) | needed | `dpkg -x` in `override-build` |
 | L2 config-engine | `sonic-supervisord-utilities-rs` | drop (supervisord) | — |
-| L2 config-engine | wheels: `sonic_py_common`, `sonic_yang_mgmt`, `sonic_yang_models`, `sonic_containercfgd`, `sonic_config_engine` | needed | `pip3 install` in `override-build` |
+| L2 config-engine | wheels: `sonic_py_common`, `sonic_yang_mgmt`, `sonic_yang_models`, `sonic_containercfgd`, `sonic_config_engine` | needed | `install-python` part (`python` plugin) |
 | L2 config-engine | `sonic_supervisord_utilities` (wheel) | drop (supervisord) | — |
 | L2 config-engine | `files/swss_vars.j2`, `files/readiness_probe.sh`, `files/container_startup.py` | needed | `organize` |
 | L2 config-engine | `rsyslog.conf`, `syslog-layer.yaml` (new) | needed | `syslog-layer.yaml` via `organize`; `rsyslog.conf` via `override-prime` |
 | L3 database | `redis-server` | needed | `redis-server_bins` slice |
 | L3 database | `redis-tools` | dedup with L1 | (covered by slices) |
-| L3 database | `click` (pip) | needed | `pip3 install` in `override-build` |
+| L3 database | `click` (pip) | needed | `install-python` part (`python` plugin) |
 | L3 database | `libdashapi` (SONiC deb) | needed | `dpkg -x` in `override-build` |
 | L3 database | `libswsscommon`, `sonic-db-cli` (SONiC debs) | dedup with L2 | single `dpkg -x` entry |
 | L3 database | `supervisord.conf.j2`, `critical_processes.j2` | drop (supervisord) | — |
@@ -250,7 +250,8 @@ These services are ported from `supervisord.conf.j2`. The changes made:
 
 Rockcraft forbids mixing chisel slices and full packages in the same
 `stage-packages` list, so packages without chisel slices go in a separate
-part for now:
+part. Python wheels go in a dedicated `python` plugin part. The manifest
+has three parts:
 
 #### 4.2.1 `install-unchiselled-packages` — full packages (temporary)
 
@@ -302,37 +303,25 @@ entirely.
         dpkg -x debs/libnl-nf-3-200_3.12.0-2_amd64.deb ${CRAFT_PART_INSTALL}
         dpkg -x debs/libnl-cli-3-200_3.12.0-2_amd64.deb ${CRAFT_PART_INSTALL}
 
-        # Install python packages
-        pip3 install --upgrade -t ${CRAFT_PART_INSTALL}/usr/lib/python3.14/dist-packages/ \
-          ./python-wheels/sonic_py_common-1.0-py3-none-any.whl \
-          ./python-wheels/sonic_yang_mgmt-1.0-py3-none-any.whl \
-          ./python-wheels/sonic_yang_models-1.0-py3-none-any.whl \
-          ./python-wheels/sonic_containercfgd-1.0-py3-none-any.whl \
-          ./python-wheels/sonic_config_engine-1.0-py3-none-any.whl \
-          jinjanator \
-          click \
-          pyangbind==0.8.7 \
-          lxml
-
         # Clean up deb/wheel source files from install tree
         rm -rf ${CRAFT_PART_INSTALL}/debs ${CRAFT_PART_INSTALL}/python-wheels ${CRAFT_PART_INSTALL}/python-debs
 ```
 
 - `plugin: dump` with `source: .` pulls the entire container directory
   (`dockers/docker-database/`) into the build. The `debs/`, `files/`,
-  `python-wheels/`, and `envs` subdirectories are staged there by
-  `build_rocks.sh` before `rockcraft pack` runs — they are not in git
-  (they're in `.gitignore`).
+  `python-wheels/` subdirectories are staged there by `build_rocks.sh`
+  before `rockcraft pack` runs — they are not in git (they're in
+  `.gitignore`).
 - **SONiC debs use `dpkg -x`, not `dpkg -i`.** `base: bare` has no dpkg
   database or postinst machinery; we just extract files into
   `${CRAFT_PART_INSTALL}`. This is why packages that need a postinst to
   create users (like `redis-server`) must come through a chisel slice that
   includes the user metadata, not through `dpkg -x`.
-- **pip wheels install to `usr/lib/python3.14/dist-packages/`** (Resolute
-  uses Python 3.14). The `-t` flag targets that directory explicitly.
-  `jinjanator`, `click`, `pyangbind`, `lxml` are pulled from PyPI by the
-  build-base's pip.
-- The final `rm -rf` keeps deb/wheel source blobs out of the primed image.
+- **deb filenames are hardcoded with versions.** When a SONiC package
+  version changes, the filename in `rockcraft.yaml` must be updated. Using
+  globs (`debs/socat_*.deb`) would avoid this but is not done here.
+- The `rm -rf` keeps deb/wheel source blobs out of the primed image. Python
+  wheels are installed by the separate `install-python` part (section 4.2.6).
 
 #### 4.2.3 `organize` — map source paths to target paths
 
@@ -340,7 +329,6 @@ entirely.
     organize:
       database_config.json.j2: usr/share/sonic/templates/database_config.json.j2
       database_global.json.j2: usr/share/sonic/templates/database_global.json.j2
-      envs: usr/share/sonic/scripts/envs
       multi_database_config.json.j2: usr/share/sonic/templates/multi_database_config.json.j2
       files/syslog-layer.yaml: usr/share/sonic/templates/
       docker-database-init.sh: usr/local/bin/docker-database-init.sh
@@ -408,8 +396,12 @@ its slices and which files each slice contains.
     override-prime: |
       craftctl default
 
-      ln -sf /usr/bin/gawk usr/bin/awk
+      # Make update script executable
       chmod +x usr/local/bin/update_chassisdb_config
+
+      # Copy rsyslog config: this must not be done in the organize step.
+      # Otherwise our rsyslog.conf will be overwritten by stage-package
+      # rsyslog's default config.
       cp ${CRAFT_PROJECT_DIR}/files/rsyslog.conf etc/rsyslog.conf
 
       # Configure redis settings (same sed as Dockerfile.j2)
@@ -422,13 +414,11 @@ its slices and which files each slice contains.
 `override-prime` runs after `stage` and is the last chance to mutate the
 primed rootfs.
 
-- **Symlinks** `awk`→`gawk`. With `base: bare`
-  it doesn't exist until you create it.
 - **`chmod +x`** on scripts that lost their exec bit during `dump`.
 - **`rsyslog.conf` must be copied in `override-prime`, not `organize`.** The
   `rsyslog` full package ships its own `/etc/rsyslog.conf`; if you put the
-  SONiC version in via `organize`, the stage-package's default overwrites it.
-  `override-prime` runs later, so the SONiC version wins.
+  SONiC version in via `organize`, the stage-package's default overwrites
+  it. `override-prime` runs later, so the SONiC version wins.
   `${CRAFT_PROJECT_DIR}/files/rsyslog.conf` resolves to
   `dockers/docker-database/files/rsyslog.conf` — a file staged into the
   build context by `build_rocks.sh` (not in git). The full chain:
@@ -440,6 +430,37 @@ primed rootfs.
   in sync.
 - **`manifest.json`** is copied to the rock root for SONiC's image
   introspection.
+
+#### 4.2.6 `install-python` — Python wheels and pip packages
+
+```yaml
+  install-python:
+    plugin: python
+    source: .
+    python-packages:
+      - ./python-wheels/sonic_py_common-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_yang_mgmt-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_yang_models-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_containercfgd-1.0-py3-none-any.whl
+      - ./python-wheels/sonic_config_engine-1.0-py3-none-any.whl
+      - jinjanator
+      - click
+      - pyangbind==0.8.7
+      - lxml
+    stage-packages:
+      - python3-venv
+```
+
+This part uses Rockcraft's `python` plugin, which creates a virtual
+environment and installs the listed packages. The SONiC wheels come from
+`python-wheels/` (staged by `build_rocks.sh`); `jinjanator`, `click`,
+`pyangbind`, `lxml` are pulled from PyPI. `python3-venv` is needed for the
+venv creation.
+
+The `python` plugin handles the Python path, the `python3` symlink, and
+console-script placement automatically — which is why the previous
+`override-prime` manual steps (`ln -sf python3.14 python3`,
+`mv .../dist-packages/bin/* usr/bin/`) are no longer needed.
 
 ---
 
@@ -458,7 +479,6 @@ three points where supervisord and pebble actually differ.
 USE_PEBBLE=false
 if pgrep -x pebble > /dev/null 2>&1; then
     USE_PEBBLE=true
-    source /usr/share/sonic/scripts/envs
     LAYER_FILE="/usr/share/sonic/templates/syslog-layer.yaml"
     pebble add syslog-layer --combine $LAYER_FILE
     pebble replan
@@ -468,9 +488,6 @@ fi
 - `pgrep -x pebble` detects whether pebble is the process manager. In the
   rock, pebble is the entrypoint, so this is true; in the Dockerfile
   container, supervisord is, so this is false.
-- `source /usr/share/sonic/scripts/envs` loads `IMAGE_VERSION` generated by
-  `build_rocks.sh`. This replaces the env vars the Dockerfile path gets from
-  the build graph.
 - The syslog layer is added to pebble dynamically at init time via
   `pebble add syslog-layer --combine` then `pebble replan`. `--combine`
   merges with existing layers rather than replacing them.
@@ -680,7 +697,8 @@ Walkthrough:
    `python-wheels/` dirs — the dirs `rockcraft.yaml`'s `source: .` picks up.
    They are gitignored.
 2. **Generate `envs`** with `IMAGE_VERSION` = branch name + commit hash. This
-   is the file `docker-database-init.sh` sources in the pebble preamble.
+   file is currently vestigial — it was sourced by the init script in an
+   earlier revision but is no longer consumed.
 3. **`rockcraft clean` + `rockcraft pack`** builds the `.rock` OCI archive.
 4. **`rockcraft.skopeo copy`** converts the `.rock` into a Docker daemon
    image tagged `<rockname>:latest`. `--insecure-policy` is needed because
@@ -750,22 +768,13 @@ packages it (and any other rock container images) into the SONiC image.
 
 ## 8. Pitfalls
 
-### 8.1 Python paths must match the runtime version
-
-Every Python path in `rockcraft.yaml` must match the Python version
-shipped in the base: the `pip3 install -t` target, the
-`ln -sf /usr/bin/python3.x usr/bin/python3` symlink, and any
-`mv usr/lib/python3.x/dist-packages/bin/* usr/bin/` in `override-prime`.
-Getting any of these wrong produces a rock where `python3` is missing or
-wheels are installed to a path Python doesn't search.
-
-### 8.2 Hardcoded deb filenames
+### 8.1 Hardcoded deb filenames
 
 The `dpkg -x debs/libyang3_3.13.6-1ubuntu0.1_amd64.deb ...` lines embed
 versions. When a SONiC package version bumps, the rock build breaks until
 you update the filename. Using globs (`debs/libyang3_*.deb`) avoids this.
 
-### 8.3 The `redis` user and `chown -R redis:redis`
+### 8.2 The `redis` user and `chown -R redis:redis`
 
 Under supervisord, redis runs as the `redis` user, so the init script
 `chown -R redis:redis` the data dirs. Under pebble in the chiselled rock,
@@ -775,7 +784,7 @@ user/group themselves come from the `redis-server_bins` (and
 `override-prime`. If your container runs a daemon as a non-root user,
 verify the user comes from a slice before relying on it.
 
-### 8.4 `rsyslog.conf` copy timing
+### 8.3 `rsyslog.conf` copy timing
 
 As explained in Phase 2, `rsyslog.conf` must be copied in `override-prime`,
 not `organize` — the `rsyslog` stage-package's own `/etc/rsyslog.conf`
@@ -783,7 +792,7 @@ overwrites it during staging. The general rule: put any file that conflicts
 with a stage-package's file in `override-prime`. The symptom of getting this
 wrong is "my rsyslog config is ignored."
 
-### 8.5 Multi-ASIC / VoQ scope
+### 8.4 Multi-ASIC / VoQ scope
 
 The docker-database rock's static pebble services only start one Redis
 instance. The Dockerfile path, by rendering `supervisord.conf.j2` per
@@ -793,36 +802,27 @@ generate a pebble layer per instance and `pebble add` + `pebble replan`.
 That is a fundamentally different architecture from the static services
 defined in `rockcraft.yaml`, and is future work beyond this case study.
 
-### 8.6 `rockcraft.skopeo`, not `skopeo`
+### 8.5 `rockcraft.skopeo`, not `skopeo`
 
 Use the `rockcraft.skopeo` binary shipped with the rockcraft snap. Bare
 `skopeo` may lack the policy support for `.rock` OCI archives. The
 `--insecure-policy` flag is required.
 
-### 8.7 Build graph integration is intentionally absent
+### 8.6 Build graph integration is intentionally absent
 
 `build_rocks.sh` runs on the host after `make`. Folding rockcraft into
 `slave.mk` / `rules/*.mk` would require reworking the `sonic-slave`
-container to include LXD and rockcraft — a separate, larger effort.
+container to include rockcraft. That's a separate, larger effort.
 
-### 8.8 Environment variables: Dockerfile `ENV` vs rockcraft `services`
+### 8.7 Environment variables: Dockerfile `ENV` vs rockcraft `services`
 
 Dockerfile's `ENV DEBIAN_FRONTEND=noninteractive`, `ENV IMAGENAME=...`,
-and `ENV DISTRO=...` are build-time / build-graph variables. They are set
-via `ENV` in the Dockerfile and propagated as container-wide environment
-variables, but no runtime script in these containers actually reads
-them. When migrating to rockcraft, do **not** blindly copy these as
-`environment:` entries on pebble services. Each `environment:` key in
-`rockcraft.yaml` sets a variable only for that specific pebble service,
-not container-wide — and if no runtime code reads the variable, it is
-dead weight. Before adding an `environment:` block, grep the container's
-scripts (`start.sh`, `rest-server.sh`, etc.) to confirm the variable is
-actually referenced at runtime. `DEBIAN_FRONTEND` is an apt-get
-build-time flag; `IMAGENAME` and `DISTRO` are Docker build-graph
-variables injected via `--build-arg`. `CONTAINER_NAME` (needed by
-rsyslog) is injected at container start by `docker_image_ctl.j2`
-(`--env "CONTAINER_NAME"=$DOCKERNAME`), not by the rock's service
-definition.
+and `ENV DISTRO=...` are build-time / build-graph variables. They are set via `ENV` in the 
+Dockerfile and propagated as container-wide environment variables, but no runtime script in 
+these containers actually reads them. 
+`DEBIAN_FRONTEND` is an apt-get build-time flag; `IMAGENAME` and `DISTRO` are Docker 
+build-graph variables injected via `--build-arg`.
+
 
 ---
 
@@ -857,6 +857,3 @@ definition.
 | `dockers/docker-base-resolute/etc/rsyslog.conf` | Referenced by `$(RSYSLOG_CONF)_PATH`, not modified |
 
 ---
-
-*End of guide. Cross-reference the source files in the `sonic-buildimage`
-tree for any detail this guide summarizes; the source code is authoritative.*
