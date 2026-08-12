@@ -78,6 +78,7 @@ You need, on the host that will run `build_rocks.sh`:
 ### 2.2 Chiselled rock mental model (`base: bare`)
 
 The docker-database rock uses bare base, instead of a full Ubuntu filesystem.
+
 ```yaml
 base: bare
 build-base: ubuntu@26.04
@@ -95,7 +96,7 @@ rootfs from two sources:
    *separate* part, because Rockcraft forbids mixing slices and full packages
    in the same `stage-packages` list.
 
-With base base, the resulting image is
+With bare base, the resulting image is
 small and contains only what you want. But you are responsible for
 listing every runtime dependency that the Dockerfile got "for
 free" from the base image. Some packages currently lack chisel slices and
@@ -499,6 +500,7 @@ rendering via `jinjanate`, chassisdb config manipulation) runs unchanged.
 The script only branches at three points:
 
 **Divergence 1 — chassisdb branch (supervisord config generation):**
+
 ```bash
 if [[ "$DATABASE_TYPE" == "chassisdb" ]]; then
     ...
@@ -519,10 +521,12 @@ if [[ "$DATABASE_TYPE" == "chassisdb" ]]; then
     exit 0
 fi
 ```
+
 For the rock, the chassisdb branch is a no-op (`exit 0`) — multi-ASIC
 chassis dynamic instance generation is out of scope.
 
 **Divergence 2 — non-chassis supervisord config generation:**
+
 ```bash
 if [[ "$USE_PEBBLE" != "true" ]]; then
     # Set protected mode based on the hostname
@@ -535,11 +539,13 @@ if [[ "$USE_PEBBLE" != "true" ]]; then
     -t .../critical_processes.j2,/etc/supervisor/critical_processes
 fi
 ```
+
 The `is_protected_mode`/`additional_data_json` jq logic exists *only* to
 feed `supervisord.conf.j2`; the rock doesn't render that template, so the
 whole block is skipped under pebble.
 
 **Divergence 3 — chown/exec vs. pebble start:**
+
 ```bash
     if [[ "$USE_PEBBLE" != "true" ]]; then
         chown -R redis:redis /var/lib/$inst
@@ -559,6 +565,7 @@ else
     exec /usr/local/bin/supervisord
 fi
 ```
+
 - Under supervisord, `chown -R redis:redis` is needed because supervisord
   launches redis as the `redis` user. Under pebble, the `redis` service runs
   as root (the rock's default) so the chowns are skipped.
@@ -584,7 +591,9 @@ ifeq ($(BLDENV), resolute)
     $(RSYSLOG_PEBBLE_LAYER)_PATH = files/rsyslog/
 endif
 ```
+
 appended to `SONIC_COPY_FILES`:
+
 ```makefile
                     $(RSYSLOG_CONF) \
                     $(RSYSLOG_PEBBLE_LAYER) \
@@ -601,6 +610,7 @@ appended to `SONIC_COPY_FILES`:
 $(RSYSLOG_CONF)_CACHE_MODE  := none
 $(RSYSLOG_PEBBLE_LAYER)_CACHE_MODE := none
 ```
+
 `CACHE_MODE=none` tells the build system not to cache these files between
 builds. They are small and may change, so always re-copy.
 
@@ -610,6 +620,7 @@ builds. They are small and may change, so always re-copy.
 $(DOCKER_CONFIG_ENGINE_RESOLUTE)_FILES += $(RSYSLOG_CONF)
 $(DOCKER_CONFIG_ENGINE_RESOLUTE)_FILES += $(RSYSLOG_PEBBLE_LAYER)
 ```
+
 This adds the two files to the docker-config-engine-resolute container's
 file list, so they're staged into *that* container's build context too (the
 Dockerfile path still uses them for its own rsyslog setup). This keeps both
@@ -625,6 +636,7 @@ log-targets:
     location: udp://127.0.0.1:514/
     services: [all]
 ```
+
 This is a Pebble *log-targets* layer: it tells pebble to forward all
 services' logs via syslog to `udp://127.0.0.1:514/` (the host's rsyslog,
 which the SONiC host config listens on). It is loaded at init time by
@@ -642,6 +654,7 @@ until [[ ($(docker exec -i database$DEV pgrep -x -c pebble) -gt 0 || $(docker ex
 # chassisdb container check (line 357):
 until [[ ($(docker exec -i ${DOCKERNAME} pgrep -x -c supervisord) -gt 0 || $(docker exec -i ${DOCKERNAME} pgrep -x -c pebble) -gt 0) && ...
 ```
+
 The host-side `docker_image_ctl.j2` template generates the container
 start/wait script. Without this change, a rock-based container (which runs
 pebble, not supervisord) would fail the readiness wait and the host would
@@ -726,6 +739,7 @@ dockers/*/python-wheels/
 dockers/*/envs
 dockers/*/*.rock
 ```
+
 The `dockers/*/` patterns cover the staged `debs/`, `files/`,
 `python-wheels/`, `envs` and the built `.rock` for every container dir, so
 adding a new container to `build_rocks.sh`'s `rocklist` needs no
@@ -749,6 +763,7 @@ make SONIC_BUILD_JOBS=4 target/sonic-vs.img.gz
 #    sonic-vs.img.gz
 make SONIC_BUILD_JOBS=4 target/sonic-vs.img.gz
 ```
+
 `build_rocks.sh` produces `target/docker-database.gz`. The final re-make
 packages it (and any other rock container images) into the SONiC image.
 
