@@ -33,15 +33,15 @@ self-hosted GitHub Actions runner（8 CPU / 32 GiB / 100 GiB，临时 VM、每�
 | 构建目标 | vs + broadcom 两个 platform target | 基础 CI 范围 |
 | 触发 | `merge_group` (checks_requested) + `workflow_dispatch` | 不在 PR 每次 push 构建；merge queue 保证最新合成 SHA 必绿才合入 |
 | PR 期间反馈 | 入队才跑，PR 打开不自动跑 | 单次构建代价高；后续可加轻量检查 |
-| job 拆分 | 拆成 test 与 build 两层：test（构建全部 deb/wheel + 内嵌单测）→ gate [build-vs, build-broadcom] 并行 | 单测无法脱离包构建单独运行（见 §4.2）；拆开使每个 job 峰值盘/内存低于单一大 job |
-| 测试构建开关 | test job `BUILD_SKIP_TEST` 不设（默认跑）；build job = y | build job 省时省盘；测试复用 test job |
+| job 结构 | 两个独立 job `build-vs` / `build-broadcom`，互不依赖、并发执行，各自构建目标 platform 的全部包并直构 target | 单测只能内嵌在包构建里跑（见 §4）；曾设 test/building 两层拆分（§6.2 修订），因 test-vs 全包构建耗时过长且与 build job 重复，2026-09-05 取消 |
+| 测试开关 | 不设置 `BUILD_SKIP_TEST`，构建时运行内嵌单测 | 两个 build job 一致 |
 | 缓存 | 本阶段不做跨 job 构建缓存 | 临时 VM；跨 job deb 缓存复用（见 §7.1）留作后续迭代 |
-| runs-on | `[self-hosted, resolute, amd64, large]` | label 只支持 AND；large/xlarge OR 需 runner group，留升级路径（见 §7） |
+| runs-on | `[self-hosted, resolute, amd64, large]`；两 job 并行各占一台 runner | label 只支持 AND；large/xlarge OR 需 runner group，留升级路径（见 §7） |
 | 构建镜像源 | 默认源（不设 MIRROR_URLS） | 标准优先 |
 | 超时 / 重试 | job 720min；`SONIC_BUILD_RETRY_COUNT=3` | 冷构建预算 |
 | 并行度 / 内存 | `SONIC_BUILD_JOBS=4`；`SONIC_BUILD_MEMORY=24g`（写入 rules/config.user） | 32G 主机 README 参考值 |
 | 产物 | vs/broadcom 两个 image 上传 GitHub artifacts，保留 7 天 | 后续可按需接装机流程 |
-| 前置依赖 | workflow 内自行安装（docker-ce + docker-buildx-plugin + jinjanator 等） | runner 可能换镜像，自包含更稳 |
+| 前置依赖 | workflow 内自行安装（docker-ce + docker-buildx-plugin + jinjanator 等），**docker 已存在但 buildx 缺失时单独补装 buildx** | runner 可能换镜像，自包含更稳；干跑实测 runner 预装 docker 无 buildx（§6.2 修订） |
 
 ## 3. Workflow 结构
 
@@ -57,7 +57,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 要构建的 ref（默认 202605_resolute）
+        description: Build ref (branch or tag)
         default: 202605_resolute
 
 concurrency:
@@ -65,16 +65,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-vs:         # 平台无关包全集构建 + 内嵌单测（PLATFORM=vs）
-  build-vs:        # needs: test-vs；BUILD_SKIP_TEST=y；target/sonic-vs.img.gz
-  build-broadcom:  # needs: test-vs；BUILD_SKIP_TEST=y；target/sonic-broadcom.bin
+  build-vs:        # 全部包构建（默认跑内嵌单测）+ target/sonic-vs.img.gz
+  build-broadcom:  # 全部包构建（默认跑内嵌单测）+ target/sonic-broadcom.bin
 ```
 
-- 三个 job `runs-on: [self-hosted, resolute, amd64, large]`；注释说明可切换 runner group。
-- `build-vs` 与 `build-broadcom` 并行，各占一台 runner。
+- 两个 job `runs-on: [self-hosted, resolute, amd64, large]`，互不依赖、并行执行，
+  各占一台 runner；注释说明可切换 runner group。
 - `workflow_dispatch` 用于 merge queue 之外的手动验证（对指定 ref）。
 - merge queue 需在仓库 branch protection 开启 “Require merge queue”，
-  并把本 workflow 的 job 设为 required check（实现细节见实施计划）。
+  并把本 workflow 的两个 job 设为 required check（实现细节见实施计划）。
 
 `concurrency` 段落含义：保证同一时刻最多一个同 group 值的 run 在执行；
 `cancel-in-progress: true` 表示新 run 到达时直接取消进行中的旧 run（而非排队等待）。
@@ -86,15 +85,19 @@ jobs:
 
 ## 4. Job 实现细节
 
-### 4.1 共用 setup（三个 job 一致，幂等）
+### 4.1 共用 setup（两个 job 一致，幂等）
 
 1. `actions/checkout@v4`：`fetch-depth: 0`，`submodules: recursive`
    （merge_group 合成 ref 是 HEAD，直接 checkout）。
-2. 安装前置：docker-ce、containerd.io、`docker-buildx-plugin`、jq、make、git、
-   python3-pip；runner 用户安装 jinjanator；`sudo modprobe overlay`；runner 用户加入
-   docker 组或经 sudo 执行 docker。
+2. 安装前置（复合动作 `install-prerequisites.sh`，经
+   `bash ${{ github.action_path }}/install-prerequisites.sh` 引用）：docker-ce、
+   containerd.io、`docker-buildx-plugin`、jq、make、git、python3-pip；runner 用户安装
+   jinjanator；`sudo modprobe overlay`；runner 用户加入 docker 组或经 sudo 执行 docker。
    - **必须显式安装 docker-buildx-plugin**：实测 docker-ce 29 不装 buildx 会退回
      legacy builder，无 BuildKit GC，中间层全部沉淀（24G 数据实测 ≈ 47G 磁盘）。
+   - **docker 已预装但 buildx 缺失时必须补装**（§6.2 干跑实测：runner 预装
+     docker-ce 29.1.3 而无 buildx plugin）：先试 Ubuntu 仓库 `docker-buildx`，不可用再
+     加 docker.com 仓装 `docker-buildx-plugin`；两条路都失败只告警不失败。
 3. 写入 `rules/config.user`（gitignored）：
    ```
    SONIC_BUILD_MEMORY = 24g
@@ -103,31 +106,22 @@ jobs:
 5. daemon.json 保持默认：BuildKit GC docker driver 默认策略（GC enabled，
    keepStorage 20GB）已足够。GC 不降低单次构建峰值，100G 预算靠控制构建规模满足。
 
-### 4.2 test-vs job
+### 4.2 build-vs / build-broadcom
 
-```bash
-make init
-make configure PLATFORM=vs
-# 枚举该配置下全部 deb + wheel 包（实测格式：一行一个 target 路径）
-make $(make list | grep -E '^target/(debs|python-wheels)/')
-```
-
-- 不设置 `BUILD_SKIP_TEST` → 包构建 recipe 内嵌单测照常运行（本 fork 无独立 tests
-  target；测试内嵌在包构建里，见 `slave.mk`）。
-- 不构建 docker 镜像、rootfs、installer（本 job 的磁盘峰值明显低于 build job）。
-- 已知噪音：`make` parse 阶段有 j2 渲染、versions-web 网络校验、sonic-build-hooks
-  打包等输出，属正常现象；网络不可达时自动降级，不阻断。
-- 失败时收集 `target/debs/**/*.log`、`target/python-wheels/**/*.log` 上传。
-
-### 4.3 build-vs / build-broadcom
+（2026-09-05 修订：原 test-vs job 取消，其职责并入两个 build job，见 §6.2。）
 
 ```bash
 make init
 make configure PLATFORM=<vs|broadcom>
-BUILD_SKIP_TEST=y make SONIC_BUILD_JOBS=4 target/sonic-vs.img.gz   # build-vs
-BUILD_SKIP_TEST=y make SONIC_BUILD_JOBS=4 target/sonic-broadcom.bin # build-broadcom
+make target/sonic-vs.img.gz      # build-vs
+make target/sonic-broadcom.bin   # build-broadcom
 ```
 
+- 不设置 `BUILD_SKIP_TEST` → target 依赖的全部 deb/wheel 包构建时内嵌单测照常
+  运行（本 fork 无独立 tests target；测试内嵌在包构建里，见 `slave.mk`）。
+- 两个 job 互不依赖（无 `needs`），由同一 workflow run 并行派发。
+- 已知噪音：`make` parse 阶段有 j2 渲染、versions-web 网络校验、sonic-build-hooks
+  打包等输出，属正常现象；网络不可达时自动降级，不阻断。
 - 删除构建成功后的临时中间产物（`rfs.squashfs` 等）以预留 artifact 传输盘余量（可选）。
 - 成功：上传 `target/sonic-vs.img.gz` / `target/sonic-broadcom.bin` 为 artifact，
   retention-days: 7。
@@ -154,30 +148,58 @@ BUILD_SKIP_TEST=y make SONIC_BUILD_JOBS=4 target/sonic-broadcom.bin # build-broa
 | rfs 拷贝 + squashfs + 最终 bin | ~8G | 实测 bin 2.1G + squashfs 1.4G + rootfs 2.8G |
 | dbg 镜像 | 0（不构建） | 设计排除 |
 
-合计峰值 ~90-100G，处于 100G 上限制上沿但可接受；三个 job 中 build-broadcom 最重。
-风险缓解顺序：buildkit GC 默认、不建 dbg、BUILD_SKIP_TEST=y（build job）、
-`SONIC_BUILD_JOBS=4`、需要时 `make clean-docker`。
+合计峰值 ~90-100G，处于 100G 上限制上沿但可接受；两个 job 并行，各自独立占满
+预算，build-broadcom 最重。
+风险缓解顺序：buildkit GC 默认、不建 dbg、`SONIC_BUILD_JOBS=4`、需要时
+`make clean-docker`。（注：2026-09-05 起两 job 均默认跑内嵌单测，
+BUILD_SKIP_TEST 不再作为缓解手段。）
 
 ## 6. 验证与上线检查
 
-1. workflow 文件合并进 `202605_resolute` 后，用 `workflow_dispatch` 手动全量验证三
-   job 一次（冷构建预算 ~3-6h）。
+1. workflow 文件合并进 `202605_resolute` 后，用 `workflow_dispatch` 手动全量验证两
+   job 一次（冷构建预算 ~2.5-5h/job，并行计最大者）。
 2. 观察 `df` 峰值余量是否足够；不足则回到 §5 缓解顺序调整。
 3. 开启 branch protection：Require merge queue + required checks 指向本 workflow。
 4. 试跑一次 merge queue 全流程（PR → 入队 → 自动合并）。
 
+### 6.2 修订记录（2026-09-04 第一次干跑后）
+
+干跑 run 33855288953（`ci-workflow/resolute-dryrun`）发现两处与假设不符：
+
+1. **buildx 缺失**：runner 预装 docker-ce 29.1.3，但 `docker buildx version` 报
+   `unknown command: docker buildx` — 注意 29.1.3 与 canonical runner 镜像一致，
+   说明 runner 模板只装 docker 不装 buildx plugin。由于 composite action 只在
+   "docker 不存在"时安装，buildx 被漏过，触发 legacy builder 风险（§4.1 约束）。
+   修订：§4.1 新增 buildx 补装分支（docker 已存在但无 buildx 时先试 Ubuntu
+   `docker-buildx`，再回退 docker.com 仓；两条路都失败只 WARN 并清理落盘源文件）。
+   r2（33884212829）验证生效：buildx 0.30.1、无 WARN。
+2. **Configure 步骤日志噪音**：test-vs 全日志 5.7MB/33757 行，其中 Configure
+   步骤 22774 行（67%）；`W: Target Packages ... configured multiple times` 6304 行
+   （host sources.list 与 ubuntu.sources 重复注册）+ dpkg 进度类 ~5100 行。
+   GitHub job 页对此类日志渲染内存 >1G。
+   曾实现一轮降噪方案（apt 源去重步骤 + tee/正则过滤管道 + 失败日志并入），
+   **用户 2026-09-05 评估后判定 over-engineering，全部撤销**；此问题仅在此登记，
+   列 §7 迭代项，后续另立设计方案再做。
+3. **job 结构改为双 build**（用户 2026-09-05）：test-vs 全包构建+单测耗时过长且
+   与后续 build job 工作重复，取消该 job；build-vs / build-broadcom 互不依赖并发，
+   均默认跑内嵌单测。代价：单测与产物同 job（峰值盘保持 §5 预算）；需要 ≥2 台
+   `[resolute, amd64, large]` runner 才能真并发（干跑观察确认）。§2/§3/§4.2/§5 同步
+   修订，required check context 变为两个 job 名。
+
 ## 7. 已记录、暂不实施的迭代项
 
-1. **跨 job deb 缓存复用**：让 build job 复用 test job 已验证过的同一批 deb 产物，
-   避免重复编译。实现方式：test job 以 `SONIC_DPKG_CACHE_METHOD=wcache` +
-   `SONIC_DPKG_CACHE_SOURCE` 把各包缓存写入目录（框架已内置，见 `Makefile.cache`，
-   SHA 依赖追踪），经 GitHub artifact 传给 build job，后者以 `rcache` 模式恢复后
-   复用，跳过重复编译。总耗时可由 ~2× 降至 ~1.3×；代价是 CI 胶水层复杂度（cache
-   一致性、几 GB 传输、静默 miss 排查）与首轮验证成本。若日后全流程耗时不可接受，
-   按此启用。
-2. **runner group 化**：`[resolute, amd64, large]` → `runs-on: {group: <包含 large
+1. **跨 job deb 缓存复用**：当前两 build job 并发且互不依赖，不存在生产者/消费者
+   关系；若未来恢复依赖链或引入独立的包构建 job，可由前序 job 以
+   `SONIC_DPKG_CACHE_METHOD=wcache` + `SONIC_DPKG_CACHE_SOURCE` 把各包缓存写入目录
+   （框架已内置，见 `Makefile.cache`，SHA 依赖追踪），经 GitHub artifact 传给后继
+   job，后者以 `rcache` 模式恢复后复用，跳过重复编译。代价是 CI 胶水层复杂度
+   （cache 一致性、几 GB 传输、静默 miss 排查）与首轮验证成本。
+2. **CI 日志体积治理**：Configure 步骤实测 22774 行且半数为 apt/dpkg 噪音（§6.2），
+   GitHub job 页渲染内存 >1G。曾实现 apt 源去重 + 输出过滤方案，用户判定
+   over-engineering 后撤销；重新设计时以「源头修复优先、最小侵入」为原则单独立项。
+3. **runner group 化**：`[resolute, amd64, large]` → `runs-on: {group: <包含 large
    与 xlarge 的组>, labels: [resolute, amd64]}`，解除对 large 单型号的绑定。
-3. **PR 期轻量反馈**：lint/语义检查等廉价 job 挂在 pull_request 上。
-4. **broadcom 硬件可用性验证**：如 future 需要，可在 squashfs 内容层做
+4. **PR 期轻量反馈**：lint/语义检查等廉价 job 挂在 pull_request 上。
+5. **broadcom 硬件可用性验证**：如 future 需要，可在 squashfs 内容层做
    x86_64-dellemc_s5232f_c3538-r0 platform 工件存在性校验。当前范围内明确不做
    （见 §1 目标 3：CI 只构建、不验证硬件目标）。
