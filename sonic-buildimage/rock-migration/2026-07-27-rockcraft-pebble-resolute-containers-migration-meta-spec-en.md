@@ -2,12 +2,12 @@
 
 **Date:** 2026-07-27
 **Branch:** `202605_resolute_rock`
-**Scope:** All SONiC containers on `vs` and `broadcom` providing basic network functionality, excluding the three already migrated (docker-database, docker-sonic-mgmt-framework, docker-eventd).
+**Scope:** All SONiC containers on `vs` and `broadcom` providing basic network functionality, excluding the four already migrated (docker-database, docker-sonic-mgmt-framework, docker-eventd, docker-router-advertiser).
 **Reference:** `feature_noble_build` branch (Noble implementation, consulted but not copied); `dockers/docker-eventd` on Resolute (completed migration, the canonical pattern).
 
 ## 1. Goal
 
-Migrate 19 containers from Dockerfile + supervisord to Rockcraft + Pebble on the
+Migrate 18 containers from Dockerfile + supervisord to Rockcraft + Pebble on the
 `202605_resolute_rock` branch (Ubuntu 26.04 / Resolute). Both the Dockerfile path and
 the new Rockcraft path must coexist in the same branch for every container.
 
@@ -19,28 +19,27 @@ common pattern.
 
 | Order | Container | Base image | Difficulty | Key challenge |
 |-------|-----------|-----------|-----------|---------------|
-| 1 | dockers/docker-router-advertiser | config-engine | ★ | supervisord.conf.j2 conditional radvd; approach A |
-| 2 | dockers/docker-mux | config-engine | ★ | single daemon (linkmgrd); create start.sh |
-| 3 | dockers/docker-macsec | swss-layer | ★ | single daemon (macsecmgrd); wpa_supplicant.conf; create start.sh |
-| 4 | dockers/docker-teamd | swss-layer | ★ | 3 daemons; iproute2 |
-| 5 | dockers/docker-iccpd | swss-layer | ★ | iccpd.sh wrapper; sonic-cfggen renders iccpd.j2 |
-| 6 | dockers/docker-sflow | swss-layer | ★ | 2 daemons; port_index_mapper.py; hsflowd sed |
-| 7 | dockers/docker-sysmgr | config-engine | ★ | single daemon (rebootbackend); 202605 new, no Noble ref; D-Bus mount |
-| 8 | dockers/docker-stp | config-engine | ★ | 2 daemons (stpd, stpmgrd); 202605 new, no Noble ref; start.sh uses supervisorctl |
-| 9 | dockers/docker-nat | swss-layer | ★★ | 2 daemons + restore_nat_entries.py; iptables symlinks |
-| 10 | dockers/docker-lldp | config-engine | ★★ | supervisord.conf.j2 (namespace_id); lldpmgrd 15KB Python; 4 daemons |
-| 11 | dockers/docker-sonic-gnmi | config-engine | ★★ | gnmi-native.sh 150 lines; 2 daemons |
-| 12 | dockers/docker-snmp | config-engine | ★★ | supervisord.conf.j2; snmpd.conf.j2 7KB; PYTHONOPTIMIZE=1; pip-compile hiredis |
-| 13 | dockers/docker-dhcp-server | config-engine | ★★ | kea-dhcp4-server; supervisor group; 4 daemons + group dependency |
-| 14 | dockers/docker-dhcp-relay | config-engine | ★★★ | **approach B**: per-VLAN dynamic relay agents; dynamic pebble layer |
-| 15 | dockers/docker-orchagent | swss-layer | ★★★ | 356-line supervisord.conf.j2; docker-init.j2 rendered at build time; many .j2 templates |
-| 16 | dockers/docker-platform-monitor | config-engine | ★★★★ | 314-line supervisord.conf.j2; 14+ conditional daemons; platform-specific logic; grpcio/thrift pip packages |
-| 17 | dockers/docker-fpm-frr | swss-layer | ★★★★ | 279-line supervisord.conf.j2; FRR routing suite; 4 config modes; frr user/group |
-| 18 | platform/broadcom/docker-syncd-brcm | — | ★★★★ | SAI syncd daemon; Broadcom platform-specific |
-| 19 | platform/vs/docker-syncd-vs | — | ★★★★ | SAI syncd daemon; VS platform-specific |
+| 1 | dockers/docker-mux | config-engine | ★ | single daemon (linkmgrd); create start.sh |
+| 2 | dockers/docker-macsec | swss-layer | ★ | single daemon (macsecmgrd); wpa_supplicant.conf; create start.sh |
+| 3 | dockers/docker-teamd | swss-layer | ★ | 3 daemons; iproute2 |
+| 4 | dockers/docker-iccpd | swss-layer | ★ | iccpd.sh wrapper; sonic-cfggen renders iccpd.j2 |
+| 5 | dockers/docker-sflow | swss-layer | ★ | 2 daemons; port_index_mapper.py; hsflowd sed |
+| 6 | dockers/docker-sysmgr | config-engine | ★ | single daemon (rebootbackend); 202605 new, no Noble ref; D-Bus mount |
+| 7 | dockers/docker-stp | config-engine | ★ | 2 daemons (stpd, stpmgrd); 202605 new, no Noble ref; start.sh uses supervisorctl |
+| 8 | dockers/docker-nat | swss-layer | ★★ | 2 daemons + restore_nat_entries.py; iptables symlinks |
+| 9 | dockers/docker-lldp | config-engine | ★★ | supervisord.conf.j2 (namespace_id); lldpmgrd 15KB Python; 4 daemons |
+| 10 | dockers/docker-sonic-gnmi | config-engine | ★★ | gnmi-native.sh 150 lines; 2 daemons |
+| 11 | dockers/docker-snmp | config-engine | ★★ | supervisord.conf.j2; snmpd.conf.j2 7KB; PYTHONOPTIMIZE=1; pip-compile hiredis |
+| 12 | dockers/docker-dhcp-server | config-engine | ★★ | kea-dhcp4-server; supervisor group; 4 daemons + group dependency |
+| 13 | dockers/docker-dhcp-relay | config-engine | ★★★ | **approach B**: per-VLAN dynamic relay agents; dynamic pebble layer |
+| 14 | dockers/docker-orchagent | swss-layer | ★★★ | 356-line supervisord.conf.j2; docker-init.j2 rendered at build time; many .j2 templates |
+| 15 | dockers/docker-platform-monitor | config-engine | ★★★★ | 314-line supervisord.conf.j2; 14+ conditional daemons; platform-specific logic; grpcio/thrift pip packages |
+| 16 | dockers/docker-fpm-frr | swss-layer | ★★★★ | 279-line supervisord.conf.j2; FRR routing suite; 4 config modes; frr user/group |
+| 17 | platform/broadcom/docker-syncd-brcm | — | ★★★★ | SAI syncd daemon; Broadcom platform-specific |
+| 18 | platform/vs/docker-syncd-vs | — | ★★★★ | SAI syncd daemon; VS platform-specific |
 
 **Already migrated** (out of scope): docker-database, docker-sonic-mgmt-framework,
-docker-eventd.
+docker-eventd, docker-router-advertiser.
 
 **Note on 202605-new containers**: docker-sysmgr and docker-stp are new in the 202605
 branch (no upstream Noble reference). They are simple config-engine based containers
@@ -52,7 +51,7 @@ Each container's migration follows the docker-eventd Resolute pattern: flatten t
 Docker three-layer inheritance chain (`docker-base-resolute` → `docker-config-engine-resolute`
 / `docker-swss-layer-resolute` → specific container) into a single `rockcraft.yaml`.
 
-Key decisions (consistent with docker-eventd, applying to all 19 containers):
+Key decisions (consistent with docker-eventd, applying to all 18 containers):
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
@@ -77,7 +76,7 @@ and become part of the final rock's runtime. Build-only tools (compilers, `-dev`
 
 ## 4. Shared Infrastructure (already in place)
 
-Established by the docker-database / docker-eventd migrations. All 19 containers reuse
+Established by the docker-database / docker-eventd migrations. All 18 containers reuse
 these without modification:
 
 | File | Location | Purpose |
@@ -99,6 +98,7 @@ rocklist=(
     "dockers/docker-database"
     "dockers/docker-sonic-mgmt-framework"
     "dockers/docker-eventd"
+    "dockers/docker-router-advertiser"
     "dockers/docker-<name>"        # ← appended per container
 )
 ```
@@ -106,6 +106,39 @@ rocklist=(
 The existing staging logic (copy `target/{debs,files,python-wheels}/resolute/*` into the
 container dir, `rockcraft pack`, `rockcraft.skopeo` conversion, `docker save | pigz`)
 requires no changes.
+
+### 4.2 Build-integration steps (per container, mandatory)
+
+Besides `rockcraft.yaml`, `start.sh` and the `build_rocks.sh` `rocklist` entry, every
+migrated container needs the following build-system edits. They were learned from the first
+four migrations and are NOT optional:
+
+1. **`rules/docker-<name>.dep`** — exclude the rockcraft.yaml from the image dependency
+   list so `make` never rebuilds the Dockerfile image over the rock:
+
+   ```make
+   DEP_FILES += $(filter-out $(DPATH)/rockcraft.yaml,$(shell git ls-files $(DPATH)))
+   ```
+
+   Without this, `make` treats `rockcraft.yaml` as an input of the Dockerfile-built image
+   and overwrites the rock output with a supervisord image.
+
+2. **`rules/docker-<name>.mk`** — only for containers currently installed as
+   `SONIC_PACKAGES_LOCAL` (SPM) packages: **docker-dhcp-relay, docker-dhcp-server,
+   docker-macsec**. Switch them to native docker images:
+
+   ```make
+   SONIC_INSTALL_DOCKER_IMAGES += $(DOCKER_<NAME>)
+   ```
+
+   A rock carries no `com.azure.sonic.versions.*` label, so installing it as an SPM package
+   makes `sonic-package-manager install --from-tarball` fail its component-dependency
+   validation (e.g. `dhcp-relay requires libswsscommon ^1.0.0 in package database^1.0.0 but
+   it is not installed`).
+
+3. **`stage-packages`** — if the rock `dpkg -x`'s `python3-libyang`, also stage
+   `python3-cffi-backend` (which provides the `_cffi_backend` module); otherwise the daemons
+   fail at runtime with `ImportError: _cffi_backend`.
 
 ## 5. Standard rockcraft.yaml Skeleton
 
@@ -425,20 +458,10 @@ fallback is reserved in the design but not the default.
 
 ## 8. Per-Container Migration Notes
 
-This section gives each container's key deviations from the standard skeleton. The three
+This section gives each container's key deviations from the standard skeleton. The four
 already-migrated containers are excluded.
 
-### 8.1 docker-router-advertiser (config-engine base)
-
-- supervisord.conf.j2 rendered at startup, but condition is simple (radvd only on ToR with
-  VLAN IPv6). Approach A.
-- **services**: rsyslogd, start, wait_for_link, radvd (radvd default disabled).
-- **start.sh pebble branch**: render `radvd.conf.j2` and `wait_for_link.sh.j2` via
-  `sonic-cfggen -d`, then conditionally `pebble start radvd`.
-- **stage-packages +=**: radvd.
-- **organize +=**: radvd.conf.j2, wait_for_link.sh.j2 → `usr/share/sonic/templates/`.
-
-### 8.2 docker-mux (config-engine base)
+### 8.1 docker-mux (config-engine base)
 
 - Single daemon linkmgrd. Noble used a rock-init.sh + `/tmp/init_ok` file-signal pattern;
   Resolute simplifies to the standard start.sh pattern.
@@ -449,7 +472,7 @@ already-migrated containers are excluded.
 - **stage-packages +=**: libboost-thread/log/program-options/filesystem1.83.0,
   libevent-2.1-7, libxml2.
 
-### 8.3 docker-macsec (swss-layer base)
+### 8.2 docker-macsec (swss-layer base)
 
 - Single daemon macsecmgrd.
 - **services**: rsyslogd, start, macsecmgrd.
@@ -458,8 +481,10 @@ already-migrated containers are excluded.
 - **stage-packages +=**: swss-layer inherited (libteam5, libteamdctl0, libsairedis,
   libsaimetadata, swss debs) + macsec-specific (wpasupplicant deb, libpcsclite1,
   liblua5.1-0).
+- **rules docker-macsec.mk**: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES`
+  (see §4.2).
 
-### 8.4 docker-teamd (swss-layer base)
+### 8.3 docker-teamd (swss-layer base)
 
 - 3 daemons: teammgrd, teamsyncd, tlm_teamd.
 - **services**: rsyslogd, start, teammgrd, teamsyncd, tlm_teamd.
@@ -469,7 +494,7 @@ already-migrated containers are excluded.
 - **special**: teammgrd `stopwaitsecs=60` → `kill-delay: 60s`; teamsyncd `startsecs=5` →
   start.sh calls `pebble start teamsyncd` after teammgrd.
 
-### 8.5 docker-iccpd (swss-layer base)
+### 8.4 docker-iccpd (swss-layer base)
 
 - 1 daemon iccpd (via iccpd.sh wrapper starting mclagsyncd + iccpd as background).
 - **services**: rsyslogd, start, iccpd.
@@ -481,7 +506,7 @@ already-migrated containers are excluded.
 - **stage-packages +=**: iptables, ebtables.
 - **No critical_processes file** (unique among surveyed containers).
 
-### 8.6 docker-sflow (swss-layer base)
+### 8.5 docker-sflow (swss-layer base)
 
 - 2 daemons: sflowmgrd, port_index_mapper.
 - **services**: rsyslogd, start, sflowmgrd, port_index_mapper.
@@ -491,7 +516,7 @@ already-migrated containers are excluded.
 - **special**: Dockerfile does `sed -ri '/^DAEMON_ARGS=""/c ...' /etc/init.d/hsflowd` —
   place this sed in `override-build` operating on `${CRAFT_PART_INSTALL}`.
 
-### 8.7 docker-sysmgr (config-engine base)
+### 8.6 docker-sysmgr (config-engine base)
 
 - Single daemon: rebootbackend. 202605-new container, no Noble reference.
 - **services**: rsyslogd, start, rebootbackend.
@@ -506,7 +531,7 @@ already-migrated containers are excluded.
   `-v /var/run/dbus:/var/run/dbus:rw`; the rock's `docker run` command must replicate
   this mount for the container to function.
 
-### 8.8 docker-stp (config-engine base)
+### 8.7 docker-stp (config-engine base)
 
 - 2 daemons: stpd, stpmgrd. 202605-new container, no Noble reference.
 - **services**: rsyslogd, start, stpd, stpmgrd.
@@ -520,7 +545,7 @@ already-migrated containers are excluded.
 - **special**: Dockerfile installs `libpython3.11` — on Resolute this should be
   `libpython3.14` (or omitted if already pulled in by `python3` stage-package).
 
-### 8.9 docker-nat (swss-layer base)
+### 8.8 docker-nat (swss-layer base)
 
 - 3 daemons: natmgrd, natsyncd, restore_nat_entries.
 - **services**: rsyslogd, start, natmgrd, natsyncd, restore_nat_entries.
@@ -531,7 +556,7 @@ already-migrated containers are excluded.
 - **special**: iptables symlinks (iptables→iptables-nft etc.) in `override-prime` via
   `ln -s` (organize cannot create symlinks).
 
-### 8.10 docker-lldp (config-engine base)
+### 8.9 docker-lldp (config-engine base)
 
 - 4 daemons: lldpd, waitfor-lldp-ready, lldp-syncd, lldpmgrd.
 - supervisord.conf.j2 rendered at startup (namespace_id). Approach A.
@@ -542,7 +567,7 @@ already-migrated containers are excluded.
   waitfor_lldp_ready.sh, *.j2 templates.
 - **python-packages +=**: lldp_syncd wheel (if in docker_lldp_whls).
 
-### 8.11 docker-sonic-gnmi (config-engine base)
+### 8.10 docker-sonic-gnmi (config-engine base)
 
 - 2 daemons: gnmi-native, dialout.
 - **services**: rsyslogd, start, gnmi-native, dialout.
@@ -550,7 +575,7 @@ already-migrated containers are excluded.
 - **organize +=**: gnmi-native.sh, dialout.sh, telemetry_vars.j2.
 - **stage-packages +=**: libxml2, libevent-2.1-7.
 
-### 8.12 docker-snmp (config-engine base)
+### 8.11 docker-snmp (config-engine base)
 
 - 2 daemons: snmpd, snmp-subagent.
 - supervisord.conf.j2 rendered at startup. Approach A.
@@ -564,7 +589,7 @@ already-migrated containers are excluded.
   `python3 -m sonic_ax_impl install` → `override-build`. pip-compile hiredis needs
   python3-dev, gcc, make → these go in **build-packages** (not stage-packages).
 
-### 8.13 docker-dhcp-server (config-engine base)
+### 8.12 docker-dhcp-server (config-engine base)
 
 - 2 daemons + supervisor group: dhcpservd, kea-dhcp4. Original used group
   `dhcp-server-ipv4`.
@@ -580,8 +605,10 @@ already-migrated containers are excluded.
 - **python-packages +=**: psutil.
 - **special**: psutil compilation needs python3-dev, build-essential → these go in the
   install-python part's **build-packages**.
+- **rules docker-dhcp-server.mk**: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES`
+  (see §4.2).
 
-### 8.14 docker-dhcp-relay (config-engine base) — approach B
+### 8.13 docker-dhcp-relay (config-engine base) — approach B
 
 - Per-VLAN dynamic relay agents. **The only approach B container.**
 - **services**: rsyslogd, start, dhcprelayd (static only; per-VLAN agents via dynamic
@@ -593,8 +620,10 @@ already-migrated containers are excluded.
 - **python-packages +=**: psutil, sonic_dhcp_utilities wheel.
 - **special**: docker_init.sh rendered supervisord.conf.j2 at startup; Rock path
   replaces this with pebble-layer.j2 rendering in start.sh.
+- **rules docker-dhcp-relay.mk**: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES`
+  (see §4.2).
 
-### 8.15 docker-orchagent (swss-layer base)
+### 8.14 docker-orchagent (swss-layer base)
 
 - Many daemons: orchagent, portsyncd, neighsyncd, vlanmgrd, intfmgrd, portmgrd, vrfmgrd,
   buffermgrd, countercheck, tunnel_packet_handler, etc. (356-line supervisord.conf.j2).
@@ -606,7 +635,7 @@ already-migrated containers are excluded.
 - **special**: tunnel_packet_handler.py (14KB), enable_counters.py, buffermgrd.sh,
   orchagent.sh (149 lines), swssconfig.sh.
 
-### 8.16 docker-platform-monitor (config-engine base)
+### 8.15 docker-platform-monitor (config-engine base)
 
 - 14+ conditional daemons: bmcctld, chassisd, chassis_db_init, lm-sensors, fancontrol,
   ledd, xcvrd, ycabled, psud, syseepromd, thermalctld, pcied, sensormond, stormond,
@@ -626,7 +655,7 @@ already-migrated containers are excluded.
 - **special**: grpc `.so` strip (in `override-build`); ssd_tools/SmartCmd 2.4MB binary;
   docker_init.j2 rendered at build time (in `override-build`).
 
-### 8.17 docker-fpm-frr (swss-layer base)
+### 8.16 docker-fpm-frr (swss-layer base)
 
 - FRR routing suite: zebra, bgpd, staticd, mgmtd, bfdd, ospfd, pimd, pathd, sharpd,
   fpmsyncd, bgpcfgd/frrcfgd, bgpmon, bfdmon, vtysh_b, bgp_eoiu_marker, zsocket, etc.
@@ -641,7 +670,7 @@ already-migrated containers are excluded.
 - **stage-packages +=**: logrotate, libgoogle-perftools4t64 (conditional).
 - **special**: 4 config modes, Traffic Shift scripts (TS/TSA/TSB/TSC), sr0 dummy interface.
 
-### 8.18 platform/broadcom/docker-syncd-brcm
+### 8.17 platform/broadcom/docker-syncd-brcm
 
 - Core daemon: syncd (SAI implementation, Broadcom SDK).
 - **services**: rsyslogd, start, syncd.
@@ -650,7 +679,7 @@ already-migrated containers are excluded.
 - **special**: requires investigation of `platform/broadcom/docker-syncd-brcm/Dockerfile.j2`
   and `.mk` before implementation (not fully surveyed in this design).
 
-### 8.19 platform/vs/docker-syncd-vs
+### 8.18 platform/vs/docker-syncd-vs
 
 - Core daemon: syncd (VS SAI implementation).
 - **services**: rsyslogd, start, syncd.
@@ -675,6 +704,8 @@ Each container migration touches:
 |------|--------|
 | `<container>/start.sh` | Append pebble detection and orchestration block (for containers with existing start.sh) |
 | `build_rocks.sh` | Append `"<container>"` to rocklist |
+| `rules/docker-<name>.dep` | `filter-out` the rockcraft.yaml from the dependency list (see §4.2) |
+| `rules/docker-<name>.mk` | Only for docker-dhcp-relay/dhcp-server/macsec: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES` (see §4.2) |
 
 ### 9.3 Unmodified files
 
@@ -683,7 +714,7 @@ Each container migration touches:
 | `Dockerfile.j2` | Docker path unchanged (coexistence) |
 | `supervisord.conf` / `supervisord.conf.j2` | Docker path only; not used in rock |
 | `critical_processes` | Docker path only; not used in rock |
-| `rules/<container>.mk` | No change |
+| `rules/<container>.mk` | Unchanged, except docker-dhcp-relay/dhcp-server/macsec (see §4.2) |
 | `rules/scripts.mk` | Already updated by docker-database migration |
 | `files/build_templates/docker_image_ctl.j2` | Already supports pebble detection |
 
