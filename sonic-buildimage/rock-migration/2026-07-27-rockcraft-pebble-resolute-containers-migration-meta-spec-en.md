@@ -456,12 +456,24 @@ implementation (e.g., the start.sh conditional logic becomes unwieldy), they can
 back to approach B by writing a `pebble-layer.j2` following the dhcp-relay pattern. This
 fallback is reserved in the design but not the default.
 
-## 8. Per-Container Migration Notes
+## 8. Comparison Baseline
+
+The remote switch `et3-dh3-f-sw1` may currently be running Ubuntu Resolute SONiC. If so, it
+serves as a useful comparison baseline: every container on that machine is still built from a
+Dockerfile, with services managed by supervisord. The objective is for each migrated
+Rockcraft + Pebble container `docker-<name>` to replicate the behavior of its counterpart on
+that machine and expose the same set of services.
+
+Before authoring the `stage-packages` list in `rockcraft.yaml`, inspect the packages actually
+installed in the corresponding container on `et3-dh3-f-sw1` to ensure the rock's runtime
+environment matches.
+
+## 9. Per-Container Migration Notes
 
 This section gives each container's key deviations from the standard skeleton. The four
 already-migrated containers are excluded.
 
-### 8.1 docker-mux (config-engine base)
+### 9.1 docker-mux (config-engine base)
 
 - Single daemon linkmgrd. Noble used a rock-init.sh + `/tmp/init_ok` file-signal pattern;
   Resolute simplifies to the standard start.sh pattern.
@@ -472,7 +484,7 @@ already-migrated containers are excluded.
 - **stage-packages +=**: libboost-thread/log/program-options/filesystem1.83.0,
   libevent-2.1-7, libxml2.
 
-### 8.2 docker-macsec (swss-layer base)
+### 9.2 docker-macsec (swss-layer base)
 
 - Single daemon macsecmgrd.
 - **services**: rsyslogd, start, macsecmgrd.
@@ -484,7 +496,7 @@ already-migrated containers are excluded.
 - **rules docker-macsec.mk**: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES`
   (see §4.2).
 
-### 8.3 docker-teamd (swss-layer base)
+### 9.3 docker-teamd (swss-layer base)
 
 - 3 daemons: teammgrd, teamsyncd, tlm_teamd.
 - **services**: rsyslogd, start, teammgrd, teamsyncd, tlm_teamd.
@@ -494,7 +506,7 @@ already-migrated containers are excluded.
 - **special**: teammgrd `stopwaitsecs=60` → `kill-delay: 60s`; teamsyncd `startsecs=5` →
   start.sh calls `pebble start teamsyncd` after teammgrd.
 
-### 8.4 docker-iccpd (swss-layer base)
+### 9.4 docker-iccpd (swss-layer base)
 
 - 1 daemon iccpd (via iccpd.sh wrapper starting mclagsyncd + iccpd as background).
 - **services**: rsyslogd, start, iccpd.
@@ -506,7 +518,7 @@ already-migrated containers are excluded.
 - **stage-packages +=**: iptables, ebtables.
 - **No critical_processes file** (unique among surveyed containers).
 
-### 8.5 docker-sflow (swss-layer base)
+### 9.5 docker-sflow (swss-layer base)
 
 - 2 daemons: sflowmgrd, port_index_mapper.
 - **services**: rsyslogd, start, sflowmgrd, port_index_mapper.
@@ -516,7 +528,7 @@ already-migrated containers are excluded.
 - **special**: Dockerfile does `sed -ri '/^DAEMON_ARGS=""/c ...' /etc/init.d/hsflowd` —
   place this sed in `override-build` operating on `${CRAFT_PART_INSTALL}`.
 
-### 8.6 docker-sysmgr (config-engine base)
+### 9.6 docker-sysmgr (config-engine base)
 
 - Single daemon: rebootbackend. 202605-new container, no Noble reference.
 - **services**: rsyslogd, start, rebootbackend.
@@ -531,7 +543,7 @@ already-migrated containers are excluded.
   `-v /var/run/dbus:/var/run/dbus:rw`; the rock's `docker run` command must replicate
   this mount for the container to function.
 
-### 8.7 docker-stp (config-engine base)
+### 9.7 docker-stp (config-engine base)
 
 - 2 daemons: stpd, stpmgrd. 202605-new container, no Noble reference.
 - **services**: rsyslogd, start, stpd, stpmgrd.
@@ -545,7 +557,7 @@ already-migrated containers are excluded.
 - **special**: Dockerfile installs `libpython3.11` — on Resolute this should be
   `libpython3.14` (or omitted if already pulled in by `python3` stage-package).
 
-### 8.8 docker-nat (swss-layer base)
+### 9.8 docker-nat (swss-layer base)
 
 - 3 daemons: natmgrd, natsyncd, restore_nat_entries.
 - **services**: rsyslogd, start, natmgrd, natsyncd, restore_nat_entries.
@@ -556,7 +568,7 @@ already-migrated containers are excluded.
 - **special**: iptables symlinks (iptables→iptables-nft etc.) in `override-prime` via
   `ln -s` (organize cannot create symlinks).
 
-### 8.9 docker-lldp (config-engine base)
+### 9.9 docker-lldp (config-engine base)
 
 - 4 daemons: lldpd, waitfor-lldp-ready, lldp-syncd, lldpmgrd.
 - supervisord.conf.j2 rendered at startup (namespace_id). Approach A.
@@ -567,7 +579,7 @@ already-migrated containers are excluded.
   waitfor_lldp_ready.sh, *.j2 templates.
 - **python-packages +=**: lldp_syncd wheel (if in docker_lldp_whls).
 
-### 8.10 docker-sonic-gnmi (config-engine base)
+### 9.10 docker-sonic-gnmi (config-engine base)
 
 - 2 daemons: gnmi-native, dialout.
 - **services**: rsyslogd, start, gnmi-native, dialout.
@@ -575,7 +587,7 @@ already-migrated containers are excluded.
 - **organize +=**: gnmi-native.sh, dialout.sh, telemetry_vars.j2.
 - **stage-packages +=**: libxml2, libevent-2.1-7.
 
-### 8.11 docker-snmp (config-engine base)
+### 9.11 docker-snmp (config-engine base)
 
 - 2 daemons: snmpd, snmp-subagent.
 - supervisord.conf.j2 rendered at startup. Approach A.
@@ -589,7 +601,7 @@ already-migrated containers are excluded.
   `python3 -m sonic_ax_impl install` → `override-build`. pip-compile hiredis needs
   python3-dev, gcc, make → these go in **build-packages** (not stage-packages).
 
-### 8.12 docker-dhcp-server (config-engine base)
+### 9.12 docker-dhcp-server (config-engine base)
 
 - 2 daemons + supervisor group: dhcpservd, kea-dhcp4. Original used group
   `dhcp-server-ipv4`.
@@ -608,7 +620,7 @@ already-migrated containers are excluded.
 - **rules docker-dhcp-server.mk**: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES`
   (see §4.2).
 
-### 8.13 docker-dhcp-relay (config-engine base) — approach B
+### 9.13 docker-dhcp-relay (config-engine base) — approach B
 
 - Per-VLAN dynamic relay agents. **The only approach B container.**
 - **services**: rsyslogd, start, dhcprelayd (static only; per-VLAN agents via dynamic
@@ -623,7 +635,7 @@ already-migrated containers are excluded.
 - **rules docker-dhcp-relay.mk**: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES`
   (see §4.2).
 
-### 8.14 docker-orchagent (swss-layer base)
+### 9.14 docker-orchagent (swss-layer base)
 
 - Many daemons: orchagent, portsyncd, neighsyncd, vlanmgrd, intfmgrd, portmgrd, vrfmgrd,
   buffermgrd, countercheck, tunnel_packet_handler, etc. (356-line supervisord.conf.j2).
@@ -635,7 +647,7 @@ already-migrated containers are excluded.
 - **special**: tunnel_packet_handler.py (14KB), enable_counters.py, buffermgrd.sh,
   orchagent.sh (149 lines), swssconfig.sh.
 
-### 8.15 docker-platform-monitor (config-engine base)
+### 9.15 docker-platform-monitor (config-engine base)
 
 - 14+ conditional daemons: bmcctld, chassisd, chassis_db_init, lm-sensors, fancontrol,
   ledd, xcvrd, ycabled, psud, syseepromd, thermalctld, pcied, sensormond, stormond,
@@ -655,7 +667,7 @@ already-migrated containers are excluded.
 - **special**: grpc `.so` strip (in `override-build`); ssd_tools/SmartCmd 2.4MB binary;
   docker_init.j2 rendered at build time (in `override-build`).
 
-### 8.16 docker-fpm-frr (swss-layer base)
+### 9.16 docker-fpm-frr (swss-layer base)
 
 - FRR routing suite: zebra, bgpd, staticd, mgmtd, bfdd, ospfd, pimd, pathd, sharpd,
   fpmsyncd, bgpcfgd/frrcfgd, bgpmon, bfdmon, vtysh_b, bgp_eoiu_marker, zsocket, etc.
@@ -670,7 +682,7 @@ already-migrated containers are excluded.
 - **stage-packages +=**: logrotate, libgoogle-perftools4t64 (conditional).
 - **special**: 4 config modes, Traffic Shift scripts (TS/TSA/TSB/TSC), sr0 dummy interface.
 
-### 8.17 platform/broadcom/docker-syncd-brcm
+### 9.17 platform/broadcom/docker-syncd-brcm
 
 - Core daemon: syncd (SAI implementation, Broadcom SDK).
 - **services**: rsyslogd, start, syncd.
@@ -679,18 +691,18 @@ already-migrated containers are excluded.
 - **special**: requires investigation of `platform/broadcom/docker-syncd-brcm/Dockerfile.j2`
   and `.mk` before implementation (not fully surveyed in this design).
 
-### 8.18 platform/vs/docker-syncd-vs
+### 9.18 platform/vs/docker-syncd-vs
 
 - Core daemon: syncd (VS SAI implementation).
 - **services**: rsyslogd, start, syncd.
 - **special**: requires investigation of `platform/vs/docker-syncd-vs/` before
   implementation. Noble's `build_rocks.sh` had it commented out, so no direct reference.
 
-## 9. Files to Create / Modify (per container)
+## 10. Files to Create / Modify (per container)
 
 Each container migration touches:
 
-### 9.1 New files
+### 10.1 New files
 
 | File | Description |
 |------|-------------|
@@ -698,7 +710,7 @@ Each container migration touches:
 | `<container>/pebble-layer.j2` | **Only docker-dhcp-relay**: dynamic pebble layer template |
 | `<container>/start.sh` | **Only containers without one**: docker-mux, docker-macsec, docker-sflow (create with pebble branch) |
 
-### 9.2 Modified files
+### 10.2 Modified files
 
 | File | Change |
 |------|--------|
@@ -707,7 +719,7 @@ Each container migration touches:
 | `rules/docker-<name>.dep` | `filter-out` the rockcraft.yaml from the dependency list (see §4.2) |
 | `rules/docker-<name>.mk` | Only for docker-dhcp-relay/dhcp-server/macsec: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES` (see §4.2) |
 
-### 9.3 Unmodified files
+### 10.3 Unmodified files
 
 | File | Reason |
 |------|--------|
@@ -718,25 +730,28 @@ Each container migration touches:
 | `rules/scripts.mk` | Already updated by docker-database migration |
 | `files/build_templates/docker_image_ctl.j2` | Already supports pebble detection |
 
-## 10. Verification (per container)
+## 11. Verification (per container)
 
 Many containers depend on the SONiC runtime environment and configuration files (Config
 DB, platform config, shared state) that are not present on a bare machine. Verification at
 this stage covers three layers: (1) Docker path regression, (2) successful rockcraft packing
-and image loading, and (3) a limited runtime check by starting the container directly on the
-build machine. Full runtime verification (daemon functionality under a complete SONiC image)
-is deferred.
+and image loading, (3) a limited runtime check by starting the container directly on the
+build machine, and (4) pack rock into SONiC vs image. Full runtime verification (daemon
+functionality under a complete SONiC image) is deferred.
 
-### 10.1 Docker path regression
+### 11.1 Docker path regression
 
+This step is to ensure that all `docker-<name>`'s dependencies has been built.
+If `target/docker-<name>.gz` file already exists, this may indicate that all dependencies are ready,
+we can skip this step. Unless step 11.2 reports error.
 ```bash
-make SONIC_BUILD_JOBS=4 target/docker-<name>.gz
+make target/docker-<name>.gz
 ```
 
 The pebble detection in `start.sh` does not affect the Docker path because
 `pgrep -x pebble` returns false in a supervisord container.
 
-### 10.2 Rock build and load
+### 11.2 Rock build and load
 
 ```bash
 # Prerequisite: make has been run to populate target/
@@ -747,7 +762,7 @@ Verify:
 - `target/docker-<name>.gz` is generated (rockcraft pack completes without errors)
 - `docker load -i target/docker-<name>.gz` succeeds (image loads into Docker daemon)
 
-### 10.3 Rock build error investigation
+### 11.3 Rock build error investigation
 
 If `rockcraft pack` fails, check:
 - Missing deb files: ensure `target/debs/resolute/` contains the expected SONiC debs
@@ -757,11 +772,13 @@ If `rockcraft pack` fails, check:
 - Missing shared libraries at load time: check `docker load` output and add the missing
   library to `stage-packages`
 
-### 10.4 Limited runtime verification (bare machine)
+### 11.4 Limited runtime verification (bare machine)
 
 After the rock builds and loads successfully, perform a limited runtime check by starting
-the container directly with `docker run` (see `dockers/docker-database/justfile` for the
-command pattern). Then check:
+the container directly with command:
+> docker run -d --name <name>_rock -t --security-opt apparmor=unconfined --security-opt="systempaths=unconfined" docker-<name>:latest
+
+Then check:
 
 1. **Container does not crash immediately**: `docker ps` shows the container still running
    after a few seconds (not exited).
@@ -780,9 +797,20 @@ it should be fixed. For example, if `pebble logs <service>` shows a Python trace
 missing binary that should have been packaged into the rock, that is a build/packaging
 defect to fix.
 
-### 10.5 Deferred: full runtime verification
+### 11.5 Pack rock into SONiC vs image
+This step should be done after 11.2. Now the `target/docker-<name>.gz` is already a 
+rockcraft packed container image.
+First, commit all changes related to migration under directory `dockers/docker-<name>` 
+```bash
+stat target/docker-<name>.gz # Record the birth time here. 
+rm -f target/sonic-vs.img.gz
+make target/sonic-vs.img.gz
+stat target/docker-<name>.gz # Verify the birth time doesn't change - the gz file shouldn't have been overwritten by the last make command.
+```
 
-Once a complete SONiC image (e.g. `target/sonic-vs.img.gz`) is built and installed, verify:
+### 11.6 (Defer to manual operation) full runtime verification
+
+If a complete SONiC image (e.g. `target/sonic-vs.img.gz`) is built and installed, verify:
 - Container starts in the SONiC environment
 - `pgrep -x pebble`, `pgrep -x rsyslogd`, `pgrep -x <daemon>` — all running
 - `pebble logs` shows no ImportError, missing shared library, or crash errors
