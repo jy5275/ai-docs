@@ -846,9 +846,21 @@ If `rockcraft pack` fails, check:
 
 ### 11.4 Limited runtime verification (bare machine)
 
-After the rock builds and loads successfully, perform a limited runtime check by starting
-the container directly with command:
-> docker run -d --name <name>_rock -t --security-opt apparmor=unconfined --security-opt="systempaths=unconfined" docker-<name>:latest
+After the rock builds and loads successfully, perform a limited runtime check by starting the container directly on any Ubuntu machine:
+```bash
+# For .rock file
+sudo rockcraft.skopeo --insecure-policy \
+    copy oci-archive:docker-${NAME}_1.0.0_amd64.rock \
+    docker-daemon:docker-${NAME}:latest
+
+# For .gz file
+docker load -i target/docker-${NAME}.gz
+
+docker container stop ${NAME}_rock || true
+docker container rm ${NAME}_rock || true
+
+docker run -d --name ${NAME}_rock -t --security-opt apparmor=unconfined --security-opt="systempaths=unconfined" docker-${NAME}:latest
+```
 
 Then check:
 
@@ -880,11 +892,173 @@ make target/sonic-vs.img.gz
 stat target/docker-<name>.gz # Verify the birth time doesn't change - the gz file shouldn't have been overwritten by the last make command.
 ```
 
-### 11.6 (Defer to manual operation) full runtime verification
+### 11.6 Full runtime verification
 
-If a complete SONiC image (e.g. `target/sonic-vs.img.gz`) is built and installed, verify:
-- Container starts in the SONiC environment
-- `pgrep -x pebble`, `pgrep -x rsyslogd`, `pgrep -x <daemon>` — all running
-- `pebble logs` shows no ImportError, missing shared library, or crash errors
-- Process list matches the Dockerfile-built container
-- Key file locations match (`/usr/bin/start.sh`, container-specific binaries, config files)
+This is a manual, end-to-end verification of migrated containers running under a complete
+SONiC VS image. It covers: access, container-inventory sanity, a per-container checklist,
+regression of the un-migrated Docker path, and a scripted pass/fail harness. It is the
+gate before a migration is considered done at the image level.
+
+#### 11.6.1 Launch the image and log in (single session)
+
+Build the full image first (see §11.5), then launch the QEMU VM daemonized, poll for SSH,
+and run commands on the switch — all in the same shell. `hostfwd` forwards guest port 22 to
+host `127.0.0.1:2200`; `-display none -serial file:...` detaches the serial console (so it
+does not hold the terminal) while still capturing SONiC boot output for debugging. log in
+over SSH (default credentials `admin` / `YourPaSsWoRd`):
+
+```bash
+gunzip -kc target/sonic-vs.img.gz > target/sonic-vs.img
+
+sudo qemu-system-x86_64 -m 8192 -smp 4 -boot order=c -name sonic \
+      -drive file=target/sonic-vs.img,media=disk,if=virtio \
+      -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2200-:22 -device virtio-net-pci,netdev=net0 \
+      -display none -daemonize -pidfile /tmp/sonic-vs.pid \
+      -serial file:/tmp/sonic-vs-serial.log
+
+# wait until sshd is reachable, then use the same session
+until sshpass -p 'YourPaSsWoRd' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -p 2200 admin@127.0.0.1 'true' </dev/null 2>/dev/null; do
+    sleep 10
+done
+echo "switch up"
+
+sshpass -p 'YourPaSsWoRd' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p 2200 admin@127.0.0.1 \
+    'uname -r'   # 7.0.0-1002-sonic
+```
+
+To observe the serial console (e.g. boot failures/panics) without a second interactive
+session: `tail -f /tmp/sonic-vs-serial.log`. Stop the VM with
+`sudo kill "$(cat /tmp/sonic-vs.pid)"`.
+
+> All verification commands below are issued on the **switch** (via `sshpass ... ssh ...
+> admin@127.0.0.1 '<cmd>'`), not on the build host. Allow a few minutes after boot for all
+> containers to start before judging results; `syncd`/`swss` initialisation can take a while.
+
+#### 11.6.2 Container inventory sanity
+
+Confirm the expected set of containers is up, then classifies each as rock (pebble) or
+Docker (supervisord). The reliable discriminator is the presence of `com.azure.sonic.versions.*`
+labels, which the Docker path bakes into the image and the rock path omits entirely (§4.2):
+
+```bash
+# 1. All containers and their state
+docker ps --format '{{.Names}}\t{{.Status}}'
+
+# 2. Classify each: 0 = rock, >=1 = Docker-path
+for c in $(docker ps --format '{{.Names}}'); do
+  n=$(docker inspect "$c" --format '{{range $k,$v := .Config.Labels}}{{$k}} {{end}}' \
+        | grep -c 'com.azure.sonic.versions' || true)
+  echo "$c  azure-labels=$n"
+done
+```
+
+Interpretation:
+
+| azure-labels | path | expected init (`docker exec <c> ps -p 1 -o comm=`) |
+|--------------|------|---------------------------------------------------|
+| `0` | rock | `pebble` |
+| `>=1` | Docker | `supervisord` |
+
+Note `docker exec <c> ps -p 1 -o comm=` is unreliable for containers launched with
+`--pid host` (e.g. `docker-sonic-gnmi` runs with the host PID namespace, so PID 1 inside the
+container is the host's `systemd`, and `pgrep -x pebble` matches *all* pebbles host-wide).
+For those containers rely on `pebble services` and `pebble logs` only.
+
+Minor gotchas: the `database` rock has no `sh` in `$PATH` (its entrypoint is
+`/usr/bin/pebble enter` and only `bash` is present), so use `docker exec database pebble …`
+or `docker exec database bash -c '…'`, never `docker exec database sh -c '…'`. Other rocks
+ship `sh` and accept `docker exec <c> sh -c '…'`.
+
+| Container | In rocklist? | Discriminator check |
+|-----------|--------------|---------------------|
+| database, mgmt-framework, eventd, radv (router-advertiser), lldp, snmp, gnmi | yes | `azure-labels=0`, `pebble services` returns a non-empty plan |
+| swss, pmon, syncd, teamd, bgp, mux, iccpd, nat, … | no | `azure-labels>=1`, `docker exec <c> supervisorctl status` works |
+
+As each of the 18 migrations lands, its container moves from the bottom row to the top.
+
+#### 11.6.3 Expected pebble service state (per migrated container)
+
+Every rock exposes the same skeleton plus its container-specific daemons. `rsyslogd` is
+`startup: enabled` and `active`; `start` is `startup: enabled` but `inactive` after its
+initial run.
+Daemon services have `startup: disabled` in the plan — whether they end up `active` is
+decided by `start.sh` reading runtime config. Run and compare:
+
+```bash
+docker exec <container> pebble services
+```
+
+If any service is in `backoff` or `error` state, that should be an error.
+
+Each service's state should match the respecitve service's state on respecitve container on
+`et3-dh3-f-sw1` remote switch. For example, if `docker exec database supervisorctl status redis` 
+on `et3-dh3-f-sw1` is active/inactive, then `docker exec database pebble services redis` 
+on our VM must show similar state (although pebble and supervisord may use different terminologies).
+
+
+#### 11.6.4 Log checks (per migrated container)
+
+For each rock container, run the two checks 
+
+1. Pebble doesn't have error operations
+
+   ```bash
+   docker exec <c> pebble changes           # every Spawned start change must be status Done, no Error
+   docker exec <c> pebble checks            # health-check config sanity (no checks in this skeleton)
+   docker exec <c> pebble health            # overall: healthy
+   ```
+
+2. Logs — no `ImportError`, `Traceback`, `cannot open shared object file`, `undefined
+   symbol`, or crash loop:
+
+   ```bash
+   docker exec <c> pebble logs            # all buffered service logs (30 lines default)
+   docker exec <c> pebble logs <service>  # one service; add -n=all for the complete buffer
+   ```
+
+   Fall back to `docker logs` for the same stream if `pebble logs` shows nothing. Filtering
+   advice: only `ImportError`, `Traceback`, `cannot open shared object file`,
+   `undefined symbol`, and `panic:` are real defect markers. Do **not** flag as defects the
+   benign noise seen routinely on a healthy VS image:
+
+   - `rsyslogd: omrelp ... error opening connection to remote peer` — expected when no
+     central syslog server is reachable;
+   - `... 'events' list is missing or empty. Skipping ...` (eventd eventdb) — normal.
+
+
+#### 11.6.5 Scripted pass/fail harness
+
+Run once per image to get one-line signal per container. Adapt the two `case` arms to the
+currently migrated set:
+
+```bash
+#!/usr/bin/env bash
+# Verify rock/pebble containers under a booted SONiC vs image.  Args: none.
+set -u
+ROCKS=(database mgmt-framework eventd radv lldp snmp gnmi)   # update as migrations land
+# Real defect markers only (see §11.6.4 for the benign-noise exclusion list).
+DEFECTS='ImportError|Traceback|cannot open shared object file|undefined symbol|panic:'
+for c in "${ROCKS[@]}"; do
+  if docker exec "$c" pebble services >/dev/null 2>&1; then
+    if docker exec "$c" pebble logs -n=all 2>&1 | grep -Eq "$DEFECTS"; then
+      echo "$c: rock RUNNING, logs=DEFECT (inspect: docker exec $c pebble logs -n=all)"
+    else
+      echo "$c: rock RUNNING, logs=clean"
+    fi
+  else
+    echo "$c: pebble NOT RESPONDING"
+  fi
+done
+for c in $(docker ps --format '{{.Names}}' | grep -vE '^('"${ROCKS[*]}"')$'); do
+  docker exec "$c" sh -c 'pgrep -x supervisord >/dev/null' 2>/dev/null \
+    && echo "$c: docker-path OK" || echo "$c: supervisord MISSING (unexpected)"
+done
+echo "pebble processes host-wide (should match container count): $(pgrep -cx pebble)"
+```
+
+**Pass criteria (summary):**
+
+1. Every container in the rocklist is up, `pebble services` reports `healthy`, and all
+   services are in expected states (as in `et3-dh3-f-sw1`).
+2. `pebble logs` (and `docker logs`) for each migrated container show no `ImportError`,
+   `Traceback`, `missing ... .so`, `undefined symbol`, or repeated `SIGx`/`crash`.
