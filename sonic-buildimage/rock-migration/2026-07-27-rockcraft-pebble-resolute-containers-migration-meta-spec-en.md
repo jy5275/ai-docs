@@ -64,7 +64,6 @@ Key decisions (consistent with docker-eventd, applying to all 18 containers):
 | Timezone commands in start.sh | Not included | Upstream removed these in 202405/202605 |
 | deb filenames in rockcraft.yaml | Wildcards (`*_*.deb`) | Avoids hardcoding versions; resilient to dependency changes |
 | Environment variables on services | None (no DEBIAN_FRONTEND/IMAGENAME/DISTRO) | docker-eventd precedent; these are build-time variables |
-| Stage filter (prime) | Not used | Image size not a concern |
 
 ### 3.1 Why build-packages vs stage-packages
 
@@ -628,9 +627,34 @@ already-migrated containers are excluded.
 
 - 2 daemons: gnmi-native, dialout.
 - **services**: rsyslogd, start, gnmi-native, dialout.
-- **start.sh**: existing (container_startup.py + config_status), append pebble branch.
+- **start.sh**: existing (container_startup.py + config_status), append pebble branch
+  (`pebble start gnmi-native; pebble start dialout`).
 - **organize +=**: gnmi-native.sh, dialout.sh, telemetry_vars.j2.
-- **stage-packages +=**: libxml2, libevent-2.1-7.
+- **stage-packages +=**: none beyond the standard config-engine list.
+
+The two container-specific deb entries are the only additions to the standard
+`setup-<name>` deb list, on top of the config-engine-inherited set (socat,
+libnl family, libswsscommon, libyang3, python3-libyang, python3-swsscommon,
+sonic-db-cli, sonic-eventd):
+
+- `sonic-mgmt-common`: ships `/usr/sbin/schema/` (the CVL schema) and
+  `/usr/sbin/cvl_cfg.json`, required by `CVL_SCHEMA_PATH=/usr/sbin/schema`
+  in gnmi-native.sh and dialout.sh.
+- `sonic-gnmi`: ships the `telemetry` and `dialout_client_cli` binaries and the
+  `/usr/models/yang/` YANG bundles dialout loads at startup.
+
+`libxml2` and `libevent-2.1-7` (listed in earlier drafts of this section) are
+**not** required: `objdump -p` on the `telemetry` and `dialout_client_cli`
+binaries shows no libxml2/libevent NEEDED entries. The binary's real runtime
+link set is libswsscommon, libhiredis, libpython3.14, libpam, libyang, libstdc++,
+libgcc_s, libc.
+
+`libpam.so.0` is supplied by the `ubuntu@26.04` base layer (verified as present
+in the base OCI blob), so it must **not** be added as a stage-package: rockcraft
+dedupes the staged copy against the base and drops it during PRIME, making the
+entry dead weight. The same dedup argument applies in general — confirm a
+library is actually absent from `ubuntu@26.04` before adding it to
+`stage-packages`.
 
 ### 9.11 docker-snmp (config-engine base)
 
