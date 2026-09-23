@@ -74,6 +74,45 @@ and become part of the final rock's runtime. Build-only tools (compilers, `-dev`
 `python3-pip`, `git`) belong in `build-packages`; runtime dependencies belong in
 `stage-packages`. This keeps the runtime image free of build tooling.
 
+### 3.2 IMAGE_VERSION propagation through the envs file
+
+The Dockerfile path bakes `IMAGE_VERSION` into the image via `ENV IMAGE_VERSION=$image_version`.
+The rock path has no equivalent `ENV` step, so `IMAGE_VERSION` must cross the build boundary
+through an `envs` file written by `build_rocks.sh` (which already emits it for every
+container, then removes it during cleanup). The propagation chain has three links:
+
+1. `build_rocks.sh` writes `echo "export IMAGE_VERSION=$(git rev-parse --abbrev-ref
+   HEAD)-$(git rev-parse HEAD)" > $rockitem/envs` (already in place, no per-container change).
+2. `rockcraft.yaml` copies it into the rock in `override-prime`:
+
+   ```yaml
+   override-prime: |
+     craftctl default
+
+     cp ${CRAFT_PROJECT_DIR}/files/rsyslog.conf etc/rsyslog.conf
+     cp ${CRAFT_PROJECT_DIR}/manifest.json manifest.json
+     cp ${CRAFT_PROJECT_DIR}/envs usr/share/sonic/templates/
+   ```
+
+3. `start.sh` sources it (guarded, so the docker/supervisord path stays clean):
+
+   ```bash
+   if [ -f /usr/share/sonic/templates/envs ]; then
+       source /usr/share/sonic/templates/envs
+   fi
+   ```
+
+**Scope it to actual consumers.** Only containers whose `start.sh` passes `IMAGE_VERSION`
+to `container_startup.py` (`... -v ${IMAGE_VERSION}`) need any of the above. For those,
+add **both** the `override-prime` copy and the `source`. Containers that never reference
+`IMAGE_VERSION` (e.g. docker-eventd, docker-database, docker-sonic-mgmt-framework) must not
+carry the `envs` copy — a copied-but-unsourced `envs` file is dead weight, and the
+`build_rocks.sh` generator alone is not a reason to include it.
+
+`DEBIAN_FRONTEND`/`IMAGENAME`/`DISTRO` are genuinely build-time and remain unset on services
+(see the "Environment variables on services" decision above); this subsection concerns only
+the runtime `IMAGE_VERSION`.
+
 ## 4. Shared Infrastructure (already in place)
 
 Established by the docker-database / docker-eventd migrations. All 18 containers reuse
@@ -233,6 +272,7 @@ parts:
 
       cp ${CRAFT_PROJECT_DIR}/files/rsyslog.conf etc/rsyslog.conf
       cp ${CRAFT_PROJECT_DIR}/manifest.json manifest.json
+      cp ${CRAFT_PROJECT_DIR}/envs usr/share/sonic/templates/  # only if start.sh sources it (§3.2)
 
   install-python:
     plugin: python
@@ -317,6 +357,10 @@ Every container's `start.sh` follows this structure:
 
 # <container's existing init logic preserved verbatim>
 
+if [ -f /usr/share/sonic/templates/envs ]; then   # only if start.sh consumes IMAGE_VERSION (§3.2)
+    source /usr/share/sonic/templates/envs
+fi
+
 if pgrep -x pebble > /dev/null 2>&1; then
     LAYER_FILE="/usr/share/sonic/templates/syslog-layer.yaml"
     pebble add syslog-layer --combine $LAYER_FILE
@@ -327,7 +371,8 @@ fi
 ```
 
 - **Docker path (supervisord)**: `pgrep -x pebble` returns false. Only the existing init
-  logic runs; daemons are started by supervisord's `dependent_startup_wait_for`.
+  logic runs; daemons are started by supervisord's `dependent_startup_wait_for`. The
+  guarded `source` of `envs` is inert because the file is absent from the Docker image.
 - **Rock path (pebble)**: `pgrep -x pebble` returns true. Loads syslog layer, replans,
   then explicitly starts daemons via `pebble start`.
 - **No timezone commands**: upstream removed these in 202405/202605.
