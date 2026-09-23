@@ -11,6 +11,9 @@ Migrate 18 containers from Dockerfile + supervisord to Rockcraft + Pebble on the
 `202605_resolute_rock` branch (Ubuntu 26.04 / Resolute). Both the Dockerfile path and
 the new Rockcraft path must coexist in the same branch for every container.
 
+The results are pushed in this PR: https://github.com/canonical/sonic-buildimage/pull/9.
+Before analysis and doing actual jobs, check if local repos and PR are in sync, and how many containers have already been migrated.
+
 ## 2. Container Inventory and Migration Order
 
 Migration is done one container at a time, easy-to-hard. Each container gets its own
