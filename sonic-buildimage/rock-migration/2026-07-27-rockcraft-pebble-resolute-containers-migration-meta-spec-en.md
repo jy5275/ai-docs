@@ -256,7 +256,6 @@ parts:
       - jq
       - libzmq5
       - libwrap0
-      - libatomic1
       - libdaemon0
       - libdbus-1-3
       - libjansson4
@@ -265,7 +264,6 @@ parts:
       # SONiC deb runtime dependencies
       - libboost-serialization1.83.0
       - libhiredis1.1.0
-      - libuuid1
       - libxxhash0
       # <container-specific packages>
 
@@ -349,6 +347,38 @@ parts:
   This avoids waiting for the full `pack` cycle on every iteration. Reserve
   `rockcraft pack` (and the subsequent `docker load` / runtime check) for the final
   confirmation that the rock is correct and runnable.
+
+- **Resolve stage-packages dependency closure, not the full list.** Rockcraft pulls
+  `stage-packages` the way `apt-get install` does: it recursively resolves and installs
+  every hard `Depends`/`PreDepends` of a listed package into the rock (you can see this in
+  any `pack` log as a long tail of packages you never listed, e.g. `libc6`, `zlib1g`,
+  `debconf`). So when package A hard-depends on B, listing only A is enough — B comes along
+  automatically, and listing B too is dead weight. Before authoring the list, compute each
+  package's dependencies on the same Ubuntu series as the rock base (for Resolute this is
+  the build host's `ubuntu@26.04`) and drop any entry that is pulled in by a peer:
+
+  ```bash
+  apt-cache depends --no-suggests --no-recommends --no-breaks \
+    --no-conflicts --no-replaces --no-enhances <pkg> | grep -E 'Depends|PreDepends'
+  ```
+
+  Two caveats temper this rule:
+
+  1. **`dpkg -x` debs are invisible to the resolver.** The SONiC debs are unpacked with
+     `dpkg -x` in `override-build`, not installed through apt, so their runtime `.so`
+     dependencies are never resolved automatically. That is exactly why the skeleton's
+     "SONiC deb runtime dependencies" group (e.g. `libboost-serialization1.83.0`,
+     `libhiredis1.1.0`, `libxxhash0`) is listed explicitly: nobody else would pull them in.
+     Do not dedupe this group against apt packages — only reason from what a listed
+     *stage-package* already depends on.
+  2. **Verify the base layer is not the provider.** A `.so` satisfied by `ubuntu@26.04`
+     itself is dead weight too, but that is a different check (see §9.10's libpam note) and
+     orthogonal to the dependency-closure rule here.
+
+  Concrete instance: the skeleton once carried `libatomic1` (a hard dependency of
+  `redis-tools`) and `libuuid1` (a hard dependency of `rsyslog`). Both are redundant
+  because every rock stages `redis-tools` and `rsyslog`; they were removed from §5 and the
+  migrated containers, leaving only the non-resolved entries behind.
 
 ## 6. start.sh Universal Pattern
 
@@ -514,6 +544,11 @@ that machine and expose the same set of services.
 Before authoring the `stage-packages` list in `rockcraft.yaml`, inspect the packages actually
 installed in the corresponding container on `et3-dh3-f-sw1` to ensure the rock's runtime
 environment matches.
+
+The remote switch `et3-dh3-f-sw1` must be accessed throught company VPN. A connection
+timeout may suggest company VPN has been turned on. If you're unable to turn it on 
+yourself, stop and ask me to turn it on manually.
+
 
 ## 9. Per-Container Migration Notes
 
@@ -884,7 +919,7 @@ defect to fix.
 ### 11.5 Pack rock into SONiC vs image
 This step should be done after 11.2. Now the `target/docker-<name>.gz` is already a 
 rockcraft packed container image.
-First, commit all changes related to migration under directory `dockers/docker-<name>` 
+
 ```bash
 stat target/docker-<name>.gz # Record the birth time here. 
 rm -f target/sonic-vs.img.gz
