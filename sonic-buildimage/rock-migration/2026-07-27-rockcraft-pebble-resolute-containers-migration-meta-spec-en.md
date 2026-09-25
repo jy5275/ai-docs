@@ -934,7 +934,7 @@ SONiC VS image. It covers: access, container-inventory sanity, a per-container c
 regression of the un-migrated Docker path, and a scripted pass/fail harness. It is the
 gate before a migration is considered done at the image level.
 
-#### 11.6.1 Launch the image and log in (single session)
+#### 11.6.1 Launch the image and log in
 
 Build the full image first (see §11.5), then launch the QEMU VM daemonized, poll for SSH,
 and run commands on the switch — all in the same shell. `hostfwd` forwards guest port 22 to
@@ -950,6 +950,9 @@ sudo qemu-system-x86_64 -m 8192 -smp 4 -boot order=c -name sonic \
       -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2200-:22 -device virtio-net-pci,netdev=net0 \
       -display none -daemonize -pidfile /tmp/sonic-vs.pid \
       -serial file:/tmp/sonic-vs-serial.log
+
+# Remove fingerprint string (ignore if not exist)
+ssh-keygen -f '/home/ubuntu/.ssh/known_hosts' -R '[127.0.0.1]:2200'
 
 # wait until sshd is reachable, then use the same session
 until sshpass -p 'YourPaSsWoRd' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -p 2200 admin@127.0.0.1 'true' </dev/null 2>/dev/null; do
@@ -970,6 +973,16 @@ session: `tail -f /tmp/sonic-vs-serial.log`. Stop the VM with
 > containers to start before judging results; `syncd`/`swss` initialisation can take a while.
 
 #### 11.6.2 Container inventory sanity
+
+Some containers may be disabled by default, enable them in order to observe and test:
+```bash
+show feature status
+sudo config feature state macsec enabled
+sudo config feature state iccpd enabled
+sudo config feature state nat enabled
+sudo config feature state sflow enabled
+...
+```
 
 Confirm the expected set of containers is up, then classifies each as rock (pebble) or
 Docker (supervisord). The reliable discriminator is the presence of `com.azure.sonic.versions.*`
