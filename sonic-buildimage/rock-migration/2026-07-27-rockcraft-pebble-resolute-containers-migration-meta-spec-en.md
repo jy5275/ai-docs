@@ -945,7 +945,7 @@ over SSH (default credentials `admin` / `YourPaSsWoRd`):
 ```bash
 gunzip -kc target/sonic-vs.img.gz > target/sonic-vs.img
 
-sudo qemu-system-x86_64 -m 8192 -smp 4 -boot order=c -name sonic \
+sudo qemu-system-x86_64 -enable-kvm -cpu host -m 8192 -smp 4 -boot order=c -name sonic \
       -drive file=target/sonic-vs.img,media=disk,if=virtio \
       -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2200-:22 -device virtio-net-pci,netdev=net0 \
       -display none -daemonize -pidfile /tmp/sonic-vs.pid \
