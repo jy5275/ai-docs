@@ -1112,10 +1112,12 @@ For each rock container, run the two checks
    - `gnmi-native` startup `jinja2.exceptions.UndefinedError: 'GNMI' is undefined` from
      `telemetry_vars.j2` — telemetry/GNMI is not configured on a default VS config; the
      native gNMI server falls back to default args and stays `active` (matches Docker path).
-   - pmon `chassis_db_init` in `error` state — on VS `import sonic_platform.platform` fails
-     (VS ships its platform API host-only, and its platform dir has no `sonic_platform`
-     wheel to install at runtime); the Docker-path supervisord silences the same exit-1
-     (`autostart=false`, `autorestart=false`). Pre-existing, not a migration defect (§12.2).
+- pmon `chassis_db_init` in `error` state — on VS `import sonic_platform.platform` fails
+      (VS ships its platform API host-only, and its platform dir has no `sonic_platform`
+      wheel to install at runtime). The Docker-path supervisord also starts it (via the
+      `dependent-startup` listener) but records the exit-1 as a silent `EXITED`
+      (`autorestart=false`), so it was never noticed. Pre-existing, not a migration defect
+      (§12.2).
 
 
 #### 11.6.5 Scripted pass/fail harness
@@ -1199,22 +1201,99 @@ post-extract relocation hack was superseded by this source-level usr-merge and d
 Diagnose `PartFilesConflict` by checking both parts' install dirs:
 `lxc --project rockcraft exec <instance> -- ls -ld /root/parts/<part>/install/{sbin,lib}`.
 
-### 12.2 pmon: `chassis_db_init` stayed in `error` on VS
+### 12.2 pmon: `chassis_db_init` stayed in `error` on VS (pre-existing; left unfixed)
 
-`chassis_db_init` does `import sonic_platform.platform`. On VS this always fails:
-`sonic-platform-vs` installs `sonic_platform` into the *host* `dist-packages` only (never the
-pmon container, and it ships no wheel), and VS defines no `SONIC_PLATFORM_API_PY3`. All three
-pmon init scripts (`docker_init.sh` / `rock_init.sh` / `start.sh`) share the same runtime
-fallback — install `sonic_platform-1.0-py3-none-any.whl` from `/usr/share/sonic/platform/` —
-and that wheel does not exist in the VS platform dir, so the install no-ops and the script
-exits `CHASSIS_LOAD_ERROR=1`.
+> Status: investigated and understood, but **deliberately left as-is** on the VS rock.
+> Record of symptoms + verified cause so a future agent can pick this up without re-deriving it.
 
-This is pre-existing, not a migration regression: the Docker-path pmon behaves identically,
-but supervisord silences it (`chassis_db_init` has `autostart=false`/`autorestart=false`, so
-an exit-1 is just logged). Do **not** "fix" it by editing `device/virtual/.../
-pmon_daemon_control.json` — that file is shared with the Docker path and `device/` is out of
-scope for a container migration. Treat the pebble `error` state as benign VS noise (the
-virtual switch has no chassis to initialise), alongside the §11.6.4 list.
+**Symptom.** On the migrated VS rock, `pebble services chassis_db_init` reports the service in
+`error` state at §11.6 verification. It is classified as benign VS noise (§11.6.4), but we
+kept the pebble `error` state rather than masking it.
+
+**What the service does.** `chassis_db_init` is a one-shot (not a long-running daemon) that
+populates the `CHASSIS_INFO` table in STATE_DB with chassis hardware metadata — `serial`,
+`model`, `revision`, `module_num` (plus `switch_host_serial` on BMC). It only matters for
+modular-chassis box management; a fixed-config box and the virtual switch have no chassis to
+report, so nothing downstream consumes this data on VS.
+
+**Root cause (verified, not a migration regression).**
+
+1. `chassis_db_init` hard-fails if it cannot load the platform API
+   (`src/sonic-platform-daemons/sonic-chassisd/scripts/chassis_db_init:107-112`):
+   ```
+   try:
+       import sonic_platform.platform
+       platform_chassis = sonic_platform.platform.Platform().get_chassis()
+   except Exception as e:
+       log.log_error("Failed to load chassis due to {}".format(repr(e)))
+       sys.exit(CHASSIS_LOAD_ERROR)  # = 1
+   ```
+2. VS never puts `sonic_platform` into the pmon container. `sonic-platform-vs`
+   (`platform/vs/sonic-platform-modules-vs/`) is built with
+   `python3 setup.py install --install-layout=deb` in its `debian/rules`
+   (`binary-indep`), which scatters the package as `.py` files into the **host**
+   `dist-packages` only — it produces no wheel and drops nothing into the platform dir.
+   VS also defines no `SONIC_PLATFORM_API_PY3` (only mellanox / alpinevs / nvidia-bluefield
+   do), so `rules/docker-platform-monitor.mk:15`'s `_PYTHON_WHEELS += $(SONIC_PLATFORM_API_PY3)`
+   evaluates empty for VS.
+3. All three init scripts share the same runtime fallback — if `import sonic_platform` fails,
+   `pip` install `sonic_platform-1.0-py3-none-any.whl` from `/usr/share/sonic/platform/`
+   (`docker_init.j2` / `rock_init.sh` / `start.sh:51-66`). On VS that path has no wheel
+   (`device/virtual/.../` contains no `*.whl`), so the install no-ops and the import still
+   fails.
+4. **Broadcom contrast (verified on `dut2`).** Real hardware platform-module debs ship the
+   wheel explicitly as a data file, e.g. Dell S5232F
+   (`platform/broadcom/sonic-platform-modules-dell/debian/platform-modules-s5232f.install:8`):
+   ```
+   build-s5232f/sonic_platform-1.0-py3-none-any.whl  usr/share/sonic/device/x86_64-dellemc_s5232f_c3538-r0
+   ```
+   The host platform dir is bind-mounted into the pmon container as `/usr/share/sonic/platform`
+   (`files/build_templates/docker_image_ctl.j2:816`), so on `dut2`
+   (`DEVICE_METADATA.localhost.platform = x86_64-dellemc_s5232f_c3538-r0`) the fallback finds the
+   wheel, installs it, and `import sonic_platform` succeeds. Because VS has no such wheel,
+   the same code path fails there.
+
+   Independent second-order blocker: VS `sonic_platform/chassis.py` reads
+   `/etc/sonic/vs_chassis_metadata.json` in `Chassis.__init__` and raises `FileNotFoundError`
+   if absent — that file is not present by default on VS. So even a successful `import` would
+   fail for VS without further setup; this confirms VS genuinely has no chassis to initialise.
+
+**How the service gets started (both paths start it — do not assume "rendered but never
+auto-started").**
+
+- Docker/supervisord path: `[program:chassis_db_init]` has `autostart=false` +
+  `dependent_startup=true` + `dependent_startup_wait_for=rsyslogd:running`
+  (`docker-pmon.supervisord.conf.j2:75-87`). SONiC registers an event listener
+  `[eventlistener:dependent-startup]` running `python3 -m supervisord_dependent_startup`
+  (conf `:6-13`). That plugin (a pip-installed wheel, present in the container at
+  `…/dist-packages/supervisord_dependent_startup/`) explicitly starts every service that is
+  `autostart=false` + `dependent_startup=true` once its `wait_for` dependency reaches RUNNING,
+  in priority order. So `chassis_db_init` **is** started on the Docker path too — the earlier
+  note "never auto-started" was wrong.
+- Rock/pebble path: `start.sh:134` loops over the rendered services and runs
+  `pebble start <svc>` unconditionally, so `chassis_db_init` is started here as well.
+
+The only difference is how a failed one-shot is *reported*: supervisord with
+`autorestart=false` records `exited (exit status 1; not expected)` and leaves the program
+`EXITED` — silent, non-blocking, easily overlooked (which is why this was never noticed on
+the Docker path; on `dut2`, where the import succeeds, the log shows
+`exited (exit status 0; expected)`). pebble instead marks the exit-1 service `error`
+(compounded by `on-failure: ignore`), surfacing it in §11.6.
+
+`chassis_db_init` is rendered unconditionally in `pebble-layer.j2:24` — unlike `chassisd`,
+which is gated by `not skip_chassisd and (IS_MODULAR_CHASSIS == 1 or is_smartswitch)`
+(`pebble-layer.j2:17`). And `device/virtual/x86_64-kvm_x86_64-r0/pmon_daemon_control.json`
+`skip`s six daemons (`ledd`/`xcvrd`/`pcied`/`psud`/`syseepromd`/`thermalctld`) but has no
+`skip_chassis_db_init`, so nothing filters it on VS.
+
+**Conclusion / constraint.** Pre-existing VS behavior (identical across Docker, 24.04 rock,
+and 26.04 rock paths), not a rock-migration regression. Do **not** "fix" it by editing
+`device/virtual/...` — that directory (and `pmon_daemon_control.json`) is shared with the
+Docker path and out of scope for a container migration; an earlier attempt to add
+`skip_chassis_db_init` there was reverted for that reason. Any future fix must live in the
+rock/pebble layer only (e.g. gate `chassis_db_init` behind the same modular-chassis condition
+as `chassisd`, or `skip` it via the rock's own daemon-control path) if it is ever revisited;
+as of now it is intentionally left alone.
 
 ### 12.3 lldp / bgp: gate one-shots report an `Error` change (benign)
 
