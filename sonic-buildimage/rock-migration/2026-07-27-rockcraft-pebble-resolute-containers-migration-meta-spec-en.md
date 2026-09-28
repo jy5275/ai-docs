@@ -409,6 +409,20 @@ fi
   then explicitly starts daemons via `pebble start`.
 - **No timezone commands**: upstream removed these in 202405/202605.
 - **No environment variables on pebble services**: consistent with docker-eventd.
+- **Quick one-shots run inline, not as pebble services**: a command that completes in under a
+  second — an init or gate script such as `restore_nat_entries.py` or `eventdb_wrapper.sh` —
+  must not be a pebble service started with `pebble start`. pebble treats any service that
+  exits within its 1-second `okayDelay` as a *failed start* ("exited quickly with code 0,
+  will ignore") even when it exits 0, which marks the change `Error` and (when it is the last
+  command) makes the `start` service exit non-zero. Instead, run the script directly as an
+  inline command in `start.sh` at the point where it should run, so its ordering relative to
+  the daemons is preserved, and drop the matching entry from the `services:` section:
+
+  ```bash
+  pebble start natmgrd
+  pebble start natsyncd
+  /usr/bin/restore_nat_entries.py   # after natsyncd, no pebble service needed
+  ```
 
 ## 7. Conditional Daemon Handling: Approach A and B
 
@@ -535,17 +549,22 @@ fallback is reserved in the design but not the default.
 
 ## 8. Comparison Baseline
 
-The remote switch `et3-dh3-f-sw1` may currently be running Ubuntu Resolute SONiC. If so, it
-serves as a useful comparison baseline: every container on that machine is still built from a
+The remote switch `et3-dh3-f-sw1` and `dut2` may currently be running Ubuntu Resolute SONiC. If so, they
+serve as useful comparison baseline: every container on the baseline switch is still built from a
 Dockerfile, with services managed by supervisord. The objective is for each migrated
 Rockcraft + Pebble container `docker-<name>` to replicate the behavior of its counterpart on
-that machine and expose the same set of services.
+that baseline switch and expose the same set of services.
+
+To choose which one to be the baseline switch: usually you should choose `et3-dh3-f-sw1` 
+because it's serving production traffic so always has more stable SONiC version installed.
+In contrast, `dut2` is just a testing device. However, if you need to modify switch status
+(e.g. run `sudo config feature state xxx enabled`), you should always use `dut2`.
 
 Before authoring the `stage-packages` list in `rockcraft.yaml`, inspect the packages actually
-installed in the corresponding container on `et3-dh3-f-sw1` to ensure the rock's runtime
+installed in the corresponding container on baseline switch to ensure the rock's runtime
 environment matches.
 
-The remote switch `et3-dh3-f-sw1` must be accessed throught company VPN. A connection
+Both `et3-dh3-f-sw1` and `dut2` must be accessed throught company VPN. A connection
 timeout may suggest company VPN has been turned on. If you're unable to turn it on 
 yourself, stop and ask me to turn it on manually.
 
@@ -962,6 +981,9 @@ echo "switch up"
 
 sshpass -p 'YourPaSsWoRd' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p 2200 admin@127.0.0.1 \
     'uname -r'   # 7.0.0-1002-sonic
+
+# After all testing, shutdown the VM gracefully
+sshpass -p 'YourPaSsWoRd' ssh -p 2200 admin@127.0.0.1 'sudo shutdown -h now'
 ```
 
 To observe the serial console (e.g. boot failures/panics) without a second interactive
@@ -1036,11 +1058,19 @@ decided by `start.sh` reading runtime config. Run and compare:
 docker exec <container> pebble services
 ```
 
-If any service is in `backoff` or `error` state, that should be an error.
+If any service is in `backoff` or `error` state, that should be an error — except pmon's
+pre-existing `chassis_db_init` on VS, which exits 1 (no chassis / no platform API, identical
+to the Docker path) and is treated as benign (§12.2, §11.6.4 exclusion).
+
+Note on one-shot services: a `startup: enabled` service whose command runs to completion
+and exits 0 will show `inactive` (with `on-success: ignore`), and a quick (<1s) exit also
+marks the *spawning change* as `Error` "exited quickly with code 0, will ignore" even though
+the service itself is healthy. This pebble behavior is benign for init/gate one-shots — see
+the §11.6.4 exclusion list; it is distinct from a genuine `error` **service state**.
 
 Each service's state should match the respecitve service's state on respecitve container on
-`et3-dh3-f-sw1` remote switch. For example, if `docker exec database supervisorctl status redis` 
-on `et3-dh3-f-sw1` is active/inactive, then `docker exec database pebble services redis` 
+the baseline remote switch. For example, if `docker exec database supervisorctl status redis` 
+on baseline switch is active/inactive, then `docker exec database pebble services redis` 
 on our VM must show similar state (although pebble and supervisord may use different terminologies).
 
 
@@ -1072,6 +1102,20 @@ For each rock container, run the two checks
    - `rsyslogd: omrelp ... error opening connection to remote peer` — expected when no
      central syslog server is reachable;
    - `... 'events' list is missing or empty. Skipping ...` (eventd eventdb) — normal.
+   - `service start attempt: exited quickly with code 0, will ignore` (a change-level
+     `Error`, not a service state) — pebble's 1s `okayDelay` marks any one-shot that
+     finishes in under a second as "exited quickly"; with `on-success: ignore` the service
+     itself lands in `inactive`, so this is expected for init/gate one-shots (eventd
+     `eventdb`, lldp `waitfor-lldp-ready`, bgp `zsocket`). Root cause is pebble v1.x
+     `internals/overlord/servstate/handlers.go` (`okayDelay = 1 * time.Second`); there is no
+     config to suppress it, so it must not be flagged as a defect.
+   - `gnmi-native` startup `jinja2.exceptions.UndefinedError: 'GNMI' is undefined` from
+     `telemetry_vars.j2` — telemetry/GNMI is not configured on a default VS config; the
+     native gNMI server falls back to default args and stays `active` (matches Docker path).
+   - pmon `chassis_db_init` in `error` state — on VS `import sonic_platform.platform` fails
+     (VS ships its platform API host-only, and its platform dir has no `sonic_platform`
+     wheel to install at runtime); the Docker-path supervisord silences the same exit-1
+     (`autostart=false`, `autorestart=false`). Pre-existing, not a migration defect (§12.2).
 
 
 #### 11.6.5 Scripted pass/fail harness
@@ -1107,6 +1151,78 @@ echo "pebble processes host-wide (should match container count): $(pgrep -cx peb
 **Pass criteria (summary):**
 
 1. Every container in the rocklist is up, `pebble services` reports `healthy`, and all
-   services are in expected states (as in `et3-dh3-f-sw1`).
+   services are in expected states (as in baseline switch).
 2. `pebble logs` (and `docker logs`) for each migrated container show no `ImportError`,
    `Traceback`, `missing ... .so`, `undefined symbol`, or repeated `SIGx`/`crash`.
+
+## 12. Working Notes
+
+### 12.1 `dpkg -x` symlink clobbering and usrmerged deb payloads
+
+Recorded during §11 verification of docker-macsec and docker-sflow. Their debs are split
+across `setup-<name>` (`plugin: dump`, `dpkg -x`) and `install-python` (`plugin: python`,
+wheels). On `ubuntu@26.04` the pack failed at the **stage** step:
+
+```
+craft_parts.errors.PartFilesConflict: Failed to stage: parts list the same file with
+different contents or permissions.
+Parts 'install-python' and 'setup-macsec' list the following files, but with different
+contents or permissions:
+    lib
+    sbin
+```
+
+**Cause.** On 26.04 rockcraft usrmerges each part's install dir by default — before each part
+builds it pre-populates `bin → usr/bin`, `lib → usr/lib`, `sbin → usr/sbin`, … symlinks — but
+**skips the `dump`/`nil` plugins** (24.04 and older never usrmerge, which is why they pack
+cleanly). So `install-python`'s top-level `sbin`/`lib` are symlinks while `setup-macsec`'s
+`dpkg -x` of `wpasupplicant_*.deb` emits real top-level `sbin/`/`lib/` directories, and the
+stage step (`craft_parts/executor/collisions.py::paths_collide()`) rejects the
+symlink-vs-directory mismatch.
+
+Pre-creating the symlinks doesn't help: `dpkg -x` (`dpkg-deb --extract`) replaces any
+pre-existing symlink with a real directory, and `enable-usrmerge` is clobbered before
+priming — neither is a workaround.
+
+**Fix.** Make the offending deb usr-merge clean at the source, so the dump part no longer
+emits top-level `sbin/`/`lib/`:
+
+- macsec: `sonic-wpa-supplicant` gitlink bumped to a usr-merge fix so wpasupplicant installs
+  under `/usr/sbin`/`/usr/lib` (commit `f5216636f`).
+- sflow: `hsflowd` build patched (`0010` sets `SYSTEMDDIR`) so its systemd unit installs under
+  `/usr/lib/systemd/system` (commit `8f541664f`).
+
+Only debs carrying legacy top-level `sbin/`/`lib/` payload needed a fix: macsec
+(`wpasupplicant`), sflow (`hsflowd`); debs already under `usr/…` needed nothing. An earlier
+post-extract relocation hack was superseded by this source-level usr-merge and dropped.
+
+Diagnose `PartFilesConflict` by checking both parts' install dirs:
+`lxc --project rockcraft exec <instance> -- ls -ld /root/parts/<part>/install/{sbin,lib}`.
+
+### 12.2 pmon: `chassis_db_init` stayed in `error` on VS
+
+`chassis_db_init` does `import sonic_platform.platform`. On VS this always fails:
+`sonic-platform-vs` installs `sonic_platform` into the *host* `dist-packages` only (never the
+pmon container, and it ships no wheel), and VS defines no `SONIC_PLATFORM_API_PY3`. All three
+pmon init scripts (`docker_init.sh` / `rock_init.sh` / `start.sh`) share the same runtime
+fallback — install `sonic_platform-1.0-py3-none-any.whl` from `/usr/share/sonic/platform/` —
+and that wheel does not exist in the VS platform dir, so the install no-ops and the script
+exits `CHASSIS_LOAD_ERROR=1`.
+
+This is pre-existing, not a migration regression: the Docker-path pmon behaves identically,
+but supervisord silences it (`chassis_db_init` has `autostart=false`/`autorestart=false`, so
+an exit-1 is just logged). Do **not** "fix" it by editing `device/virtual/.../
+pmon_daemon_control.json` — that file is shared with the Docker path and `device/` is out of
+scope for a container migration. Treat the pebble `error` state as benign VS noise (the
+virtual switch has no chassis to initialise), alongside the §11.6.4 list.
+
+### 12.3 lldp / bgp: gate one-shots report an `Error` change (benign)
+
+Gate one-shots that finish in <1s hit pebble's 1s `okayDelay` and report "exited quickly with
+code 0, will ignore" on the change only; the service is `inactive` and the gated daemons
+start fine. Benign (§11.6.4 exclusion list).
+
+### 12.4 gnmi-native: `UndefinedError: 'GNMI' is undefined` (benign)
+
+At boot (telemetry not configured on the default VS config) gnmi-native logs this traceback;
+it falls back to default args and stays `active`. Pre-existing; benign (§11.6.4).
