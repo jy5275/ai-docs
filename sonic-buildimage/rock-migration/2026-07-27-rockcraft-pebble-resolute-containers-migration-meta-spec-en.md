@@ -265,6 +265,8 @@ parts:
       - libboost-serialization1.83.0
       - libhiredis1.1.0
       - libxxhash0
+      # libnl-3/genl/route/nf come along as hard Depends of libnl-cli-3-200
+      - libnl-cli-3-200
       # <container-specific packages>
 
     override-prime: |
@@ -379,6 +381,27 @@ parts:
   `redis-tools`) and `libuuid1` (a hard dependency of `rsyslog`). Both are redundant
   because every rock stages `redis-tools` and `rsyslog`; they were removed from §5 and the
   migrated containers, leaving only the non-resolved entries behind.
+
+- **Consume stock Ubuntu packages from the archive, not from `debs/`.** Direction: all
+  dependencies converge on the Ubuntu archive, which owns their versions; the build takes
+  the archive's default version. A deb under `target/debs/resolute/` that is a stock
+  archive package — typically a `SONIC_ONLINE_DEBS` entry fetched from
+  `archive.ubuntu.com`, as opposed to a SONiC source build (`SONIC_MAKE_DEBS` /
+  `SONIC_DPKG_DEBS`) — must be listed in `stage-packages`, not `dpkg -x`'d. The switch is
+  consumer-first: rocks stop consuming the local copy while `rules/*.mk` stays in place for
+  the Docker path and compile-time users, and is removed later in a separate change.
+  - Apply the dependency-closure rule above: list only the top of the closure
+    (`libnl-cli-3-200` hard-depends `(= 3.12.0-2)` on libnl-3/genl/route/nf, so it alone
+    brings all five).
+  - In a part that uses chisel slices (docker-database), put the package in its
+    unchiselled part; slices and whole packages cannot be mixed in one part.
+  - Verify equivalence before switching: `sha256sum` the local deb against
+    `apt-get download <pkg>`, then build with that deb **excluded** from `debs/` and check
+    that `parts/*/stage_packages/` holds the archive deb and `ldd` finds no `not found` for
+    every prime ELF linking it.
+  - Concrete instance: libnl3 (`rules/libnl3.mk`, `SONIC_ONLINE_DEBS`, byte-identical to
+    `resolute/main` `3.12.0-2`) moved from five `dpkg -x debs/libnl-*` lines to the
+    `libnl-cli-3-200` stage-package in every rock.
 
 ## 6. start.sh Universal Pattern
 
