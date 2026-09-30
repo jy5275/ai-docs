@@ -1,13 +1,16 @@
 # Rockcraft + Pebble Migration: Resolute Containers Meta-Spec
 
 **Date:** 2026-07-27
+
 **Branch:** `202605_resolute_rock`
-**Scope:** All SONiC containers on `vs` and `broadcom` providing basic network functionality, excluding the four already migrated (docker-database, docker-sonic-mgmt-framework, docker-eventd, docker-router-advertiser).
-**Reference:** `feature_noble_build` branch (Noble implementation, consulted but not copied); `dockers/docker-eventd` on Resolute (completed migration, the canonical pattern).
+
+**Scope:** All SONiC containers on `vs` and `broadcom` providing basic network functionality.
+
+**Reference:** `feature_noble_build` branch (Noble implementation, consulted but not copied).
 
 ## 1. Goal
 
-Migrate 18 containers from Dockerfile + supervisord to Rockcraft + Pebble on the
+Migrate 17 containers from Dockerfile + supervisord to Rockcraft + Pebble on the
 `202605_resolute_rock` branch (Ubuntu 26.04 / Resolute). Both the Dockerfile path and
 the new Rockcraft path must coexist in the same branch for every container.
 
@@ -16,13 +19,13 @@ Before analysis and doing actual jobs, check if local repos and PR are in sync, 
 
 ## 2. Container Inventory and Migration Order
 
-Migration is done one container at a time, easy-to-hard. Each container gets its own
+Migration is done one container at a time. Each container gets its own
 implementation plan (via the writing-plans skill) referencing this meta-spec for the
 common pattern.
 
 | Order | Container | Base image | Difficulty | Key challenge |
 |-------|-----------|-----------|-----------|---------------|
-| 1 | dockers/docker-mux | config-engine | ★ | single daemon (linkmgrd); create start.sh |
+| — | ~~dockers/docker-mux~~ | config-engine | — | **Not migrated**: does not run on SONiC; excluded from this spec |
 | 2 | dockers/docker-macsec | swss-layer | ★ | single daemon (macsecmgrd); wpa_supplicant.conf; create start.sh |
 | 3 | dockers/docker-teamd | swss-layer | ★ | 3 daemons; iproute2 |
 | 4 | dockers/docker-iccpd | swss-layer | ★ | iccpd.sh wrapper; sonic-cfggen renders iccpd.j2 |
@@ -41,20 +44,17 @@ common pattern.
 | 17 | platform/broadcom/docker-syncd-brcm | — | ★★★★ | SAI syncd daemon; Broadcom platform-specific |
 | 18 | platform/vs/docker-syncd-vs | — | ★★★★ | SAI syncd daemon; VS platform-specific |
 
-**Already migrated** (out of scope): docker-database, docker-sonic-mgmt-framework,
-docker-eventd, docker-router-advertiser.
-
 **Note on 202605-new containers**: docker-sysmgr and docker-stp are new in the 202605
 branch (no upstream Noble reference). They are simple config-engine based containers
 and follow the standard pattern without special difficulty.
 
 ## 3. Architecture Overview
 
-Each container's migration follows the docker-eventd Resolute pattern: flatten the
+Each container's migration follows the same pattern: flatten the
 Docker three-layer inheritance chain (`docker-base-resolute` → `docker-config-engine-resolute`
 / `docker-swss-layer-resolute` → specific container) into a single `rockcraft.yaml`.
 
-Key decisions (consistent with docker-eventd, applying to all 18 containers):
+Key decisions (consistent with docker-eventd, applying to all 17 containers):
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
@@ -68,7 +68,7 @@ Key decisions (consistent with docker-eventd, applying to all 18 containers):
 | deb filenames in rockcraft.yaml | Wildcards (`*_*.deb`) | Avoids hardcoding versions; resilient to dependency changes |
 | Environment variables on services | None (no DEBIAN_FRONTEND/IMAGENAME/DISTRO) | docker-eventd precedent; these are build-time variables |
 
-### 3.1 Why build-packages vs stage-packages
+### 3.1 `build-packages` vs `stage-packages`
 
 `build-packages` are installed in the build-base environment for the build step only and
 do **not** enter the final rock. `stage-packages` are unpacked into the stage directory
@@ -115,10 +115,13 @@ carry the `envs` copy — a copied-but-unsourced `envs` file is dead weight, and
 (see the "Environment variables on services" decision above); this subsection concerns only
 the runtime `IMAGE_VERSION`.
 
-## 4. Shared Infrastructure (already in place)
+### 3.3 Non-example: `docker-database`
+`docker-database` is a fully chiselled rock, with bare base (instead of ubuntu base) and 
+`stage-packages` all slices names (instead of all package names). Other rocks' dependencies
+haven't been fully chiselled in chisel-releases yet, so don't follow `docker-database`'s 
+migration pattern.
 
-Established by the docker-database / docker-eventd migrations. All 18 containers reuse
-these without modification:
+## 4. Files shared by all containers (already in place)
 
 | File | Location | Purpose |
 |------|----------|---------|
@@ -152,7 +155,7 @@ requires no changes.
 
 Besides `rockcraft.yaml`, `start.sh` and the `build_rocks.sh` `rocklist` entry, every
 migrated container needs the following build-system edits. They were learned from the first
-four migrations and are NOT optional:
+four migrations:
 
 1. **`rules/docker-<name>.dep`** — exclude the rockcraft.yaml from the image dependency
    list so `make` never rebuilds the Dockerfile image over the rock:
@@ -183,8 +186,7 @@ four migrations and are NOT optional:
 
 ## 5. Standard rockcraft.yaml Skeleton
 
-All containers follow this three-part skeleton (based on docker-eventd). `<container-specific>`
-placeholders are replaced per container.
+All containers follow this three-part skeleton.
 
 ```yaml
 name: docker-<name>
@@ -268,13 +270,24 @@ parts:
       # libnl-3/genl/route/nf come along as hard Depends of libnl-cli-3-200
       - libnl-cli-3-200
       # <container-specific packages>
+    
+    prime:
+      # Exclude unnecessary artifacts that `source: .` dumps at the rock root
+      - -files
+      - -envs
+      - -python-debs
+      - -vcache
+      - -base_image_files
+      - -buildinfo
+      - -Dockerfile*
+      - -supervisord.conf
+      - -critical_processes
 
     override-prime: |
       craftctl default
 
       cp ${CRAFT_PROJECT_DIR}/files/rsyslog.conf etc/rsyslog.conf
       cp ${CRAFT_PROJECT_DIR}/manifest.json manifest.json
-      cp ${CRAFT_PROJECT_DIR}/envs usr/share/sonic/templates/  # only if start.sh sources it (§3.2)
 
   install-python:
     plugin: python
@@ -286,11 +299,6 @@ parts:
       - ./python-wheels/sonic_yang_models-1.0-py3-none-any.whl
       - ./python-wheels/sonic_containercfgd-1.0-py3-none-any.whl
       - ./python-wheels/sonic_config_engine-1.0-py3-none-any.whl
-      # common pip packages
-      - jinjanator
-      - click
-      - pyangbind==0.8.7
-      - lxml
       # <container-specific pip packages>
     stage-packages:
       - python3-venv
@@ -308,21 +316,22 @@ parts:
 
 ### 5.1 Design notes for the skeleton
 
+- **Noble reference deviation**: Noble's rockcraft.yaml files use many per-deb parts
+  (`install-<deb>_<version>_amd64`) plus a large `install-common-files` part that copies
+  everything via `cp` in `override-prime`. Resolute improves on this: a single
+  `setup-<name>` part installs all debs via `dpkg -x` and places files via `organize`.
 - **`organize` over `cp`**: Source file placement uses `organize` (declarative) rather
   than `cp` in `override-build`/`override-prime`. The only exceptions are `rsyslog.conf`
   (the `rsyslog` stage-package overwrites it with a default config, so it must be copied
   in `override-prime` after staging) and `manifest.json` (must be at the rock root).
+- `prime:` excludes the unnecessary build inputs that `source: .` dumps at the rock 
+  root.
 - **deb wildcards**: `dpkg -x debs/<pkg>_*.deb` avoids hardcoding version numbers.
 - **python symlink**: not needed. The `python3-minimal` apt package (pulled in by
   `stage-packages: [python3]`) already provides `/usr/bin/python3 -> python3.14`.
 - **add-user part**: Creates the `syslog` user/group needed by rsyslog, using
   `overlay-script` in the overlay chroot where `/etc/passwd` and `/etc/group` come from
   the `ubuntu@26.04` base.
-- **Noble reference deviation**: Noble's rockcraft.yaml files use many per-deb parts
-  (`install-<deb>_<version>_amd64`) plus a large `install-common-files` part that copies
-  everything via `cp` in `override-prime`. Resolute improves on this: a single
-  `setup-<name>` part installs all debs via `dpkg -x` and places files via `organize`.
-  This is more concise and more declarative.
 
 ### 5.2 Authoring principles
 
@@ -331,7 +340,7 @@ parts:
   entries carried over from earlier migrations. For every line in a `rockcraft.yaml`, be
   able to trace its necessity back to a concrete source in the current branch — typically
   `Dockerfile.j2`, `rules/*.mk`, or other files in the same container directory. If no
-  such basis exists, the line is a candidate for removal.
+  such basis exists, the line may be a candidate for removal.
 - **Verify by removal, not by packing.** When an element is suspected to be unnecessary,
   remove it and test whether the rock still builds and runs. `rockcraft pack` runs the
   entire lifecycle (pull → overlay → build → stage → prime) plus OCI layer creation in one
@@ -374,13 +383,8 @@ parts:
      Do not dedupe this group against apt packages — only reason from what a listed
      *stage-package* already depends on.
   2. **Verify the base layer is not the provider.** A `.so` satisfied by `ubuntu@26.04`
-     itself is dead weight too, but that is a different check (see §9.10's libpam note) and
+     itself is dead weight too, but that is a different check (see §9.9's libpam note) and
      orthogonal to the dependency-closure rule here.
-
-  Concrete instance: the skeleton once carried `libatomic1` (a hard dependency of
-  `redis-tools`) and `libuuid1` (a hard dependency of `rsyslog`). Both are redundant
-  because every rock stages `redis-tools` and `rsyslog`; they were removed from §5 and the
-  migrated containers, leaving only the non-resolved entries behind.
 
 - **Consume stock Ubuntu packages from the archive, not from `debs/`.** Direction: all
   dependencies converge on the Ubuntu archive, which owns their versions; the build takes
@@ -399,9 +403,20 @@ parts:
     `apt-get download <pkg>`, then build with that deb **excluded** from `debs/` and check
     that `parts/*/stage_packages/` holds the archive deb and `ldd` finds no `not found` for
     every prime ELF linking it.
-  - Concrete instance: libnl3 (`rules/libnl3.mk`, `SONIC_ONLINE_DEBS`, byte-identical to
-    `resolute/main` `3.12.0-2`) moved from five `dpkg -x debs/libnl-*` lines to the
-    `libnl-cli-3-200` stage-package in every rock.
+
+- **Add necessary maintainer script logic**: packages listed under
+  `stage-packages` in rockcraft.yaml are only **unpacked** (rather than installed) during 
+  the `rockcraft pack` - a process similar as what `dpkg -x` does - doesn't run 
+  maintainer scripts, doesn't update dpkg status database, and skip many other steps that
+  a normal deb package installation would do. Therefore, some of the skipped steps are necessary to be added back in `rockcraft.yaml`, like the `add-user` part in every rock.
+  If necessary, look into rockcraft's source code to find out how packages are installed
+  in a rock.
+
+- **Translation of supervisord service configuration**: in supervisord.conf, a service 
+  having the config item `autostart=false` doesn't mean it not get started at bootup. 
+  The event listener dependent-startup controls the starting order in supervisord. Don't be 
+  cheated by a single config item, always analyze the services behavior in a container-wide view.
+
 
 ## 6. start.sh Universal Pattern
 
@@ -431,27 +446,25 @@ fi
 - **Rock path (pebble)**: `pgrep -x pebble` returns true. Loads syslog layer, replans,
   then explicitly starts daemons via `pebble start`.
 - **No timezone commands**: upstream removed these in 202405/202605.
-- **No environment variables on pebble services**: consistent with docker-eventd.
 - **Quick one-shots run inline, not as pebble services**: a command that completes in under a
   second — an init or gate script such as `restore_nat_entries.py` or `eventdb_wrapper.sh` —
-  must not be a pebble service started with `pebble start`. pebble treats any service that
-  exits within its 1-second `okayDelay` as a *failed start* ("exited quickly with code 0,
-  will ignore") even when it exits 0, which marks the change `Error` and (when it is the last
-  command) makes the `start` service exit non-zero. Instead, run the script directly as an
+  shouldn't be a pebble service started with `pebble start`. pebble treats any service that
+  exits within 1-second as a *failed start*, even when it exits 0, which marks the change 
+  `Error` and makes the `start` service exit non-zero. Instead, run the script directly as an
   inline command in `start.sh` at the point where it should run, so its ordering relative to
-  the daemons is preserved, and drop the matching entry from the `services:` section:
-
+  the daemons is preserved, and drop the matching entry from the `services:` section.
+  Example:
   ```bash
   pebble start natmgrd
   pebble start natsyncd
-  /usr/bin/restore_nat_entries.py   # after natsyncd, no pebble service needed
+  /usr/bin/restore_nat_entries.py # Don't make restore_nat_entries a pebble service
   ```
 
 ## 7. Conditional Daemon Handling: Approach A and B
 
 ### 7.1 Approach A — static services + start.sh on-demand start (default)
 
-**Applies to**: all containers except docker-dhcp-relay.
+**Applies to**: majority of containers
 
 The `services` section in `rockcraft.yaml` enumerates every daemon the container **may**
 run. All daemons except `rsyslogd` and `start` omit the `startup` key (default `disabled`,
@@ -510,10 +523,10 @@ if pgrep -x pebble > /dev/null 2>&1; then
 fi
 ```
 
-### 7.2 Approach B — dynamic pebble layer (docker-dhcp-relay only)
+### 7.2 Approach B — dynamic pebble layer
 
-**Applies to**: docker-dhcp-relay (per-VLAN relay agents, count determined at runtime,
-cannot be enumerated statically).
+**Applies to**: complex containers, like docker-dhcp-relay 
+(per-VLAN relay agents, count determined at runtime, cannot be enumerated statically).
 
 The `services` section declares only static services (`rsyslogd`, `start`, `dhcprelayd`).
 A new file `pebble-layer.j2` translates the original `supervisord.conf.j2` into pebble
@@ -572,11 +585,11 @@ fallback is reserved in the design but not the default.
 
 ## 8. Comparison Baseline
 
-The remote switch `et3-dh3-f-sw1` and `dut2` may currently be running Ubuntu Resolute SONiC. If so, they
-serve as useful comparison baseline: every container on the baseline switch is still built from a
-Dockerfile, with services managed by supervisord. The objective is for each migrated
-Rockcraft + Pebble container `docker-<name>` to replicate the behavior of its counterpart on
-that baseline switch and expose the same set of services.
+The remote switch `et3-dh3-f-sw1` and `dut2` may currently be running Ubuntu Resolute SONiC. 
+If so, they serve as useful comparison baseline: every container on the baseline switch is 
+still built from a Dockerfile, with services managed by supervisord. The objective is for 
+each migrated Rockcraft + Pebble container `docker-<name>` to replicate the behavior of 
+its counterpart on that baseline switch and expose the same set of services.
 
 To choose which one to be the baseline switch: usually you should choose `et3-dh3-f-sw1` 
 because it's serving production traffic so always has more stable SONiC version installed.
@@ -591,24 +604,20 @@ Both `et3-dh3-f-sw1` and `dut2` must be accessed throught company VPN. A connect
 timeout may suggest company VPN has been turned on. If you're unable to turn it on 
 yourself, stop and ask me to turn it on manually.
 
+If neither `et3-dh3-f-sw1` nor `dut2` is running Ubuntu Resolute SONiC in a good state,
+don't fix them, try to complete the migration without a comparison baseline.
 
 ## 9. Per-Container Migration Notes
 
 Only what a container does **differently** from §5–§7 and cannot be read off its
 `services` / `stage-packages` / `organize` / `python-packages` lists — read those in
-`dockers/<name>/rockcraft.yaml`. Not repeated per entry: every swss-layer rock also
+`dockers/<name>/rockcraft.yaml`. 
+
+Not repeated per entry: every swss-layer rock also
 `dpkg -x`'s the swss-layer debs (libsairedis, libsaimetadata, libteam5, libteamdctl0,
-libnexthopgroup, libdashapi, swss) and carries a `prime:` exclusion list for the build
-inputs that `source: .` dumps at the rock root. The four containers outside this spec's
-scope (database, mgmt-framework, eventd, router-advertiser) have their own design docs.
+libnexthopgroup, libdashapi, swss).
 
-### 9.1 docker-mux — not migrated
-
-- No start.sh and no `[program:start]` in `supervisord.conf`: create a rock-only start.sh
-  (`pebble start linkmgrd`). Noble's `rock-init.sh` + `/tmp/init_ok` signal is not reused.
-- Not yet in `build_rocks.sh` rocklist.
-
-### 9.2 docker-macsec — migrated
+### 9.1 docker-macsec — migrated
 
 - start.sh is rock-only (the Dockerfile does not copy it) and holds only the pebble branch.
 - `etc/wpa_supplicant.conf` and `cli/` land by `source: .` path, not `organize`; `prime:`
@@ -616,13 +625,13 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
 - wpasupplicant made usr-merge clean at the source (§12.1).
 - Installed as a native docker image, not an SPM package (§4.2; done).
 
-### 9.3 docker-teamd — migrated
+### 9.2 docker-teamd — migrated
 
 - teammgrd `kill-delay: 60s` (supervisord `stopwaitsecs=60`); teamsyncd's `startsecs=5`
   has no pebble equivalent — it is only started after teammgrd in start.sh.
 - Extra deb: `libteam-utils`.
 
-### 9.4 docker-iccpd — migrated
+### 9.3 docker-iccpd — migrated
 
 - `iccpd.sh` is the service command: mclagsyncd in background, iccpd in foreground.
 - `chmod +x start.sh iccpd.sh` in `override-build` (both are 100644 in git; the Dockerfile
@@ -631,14 +640,13 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
   never runs in a rock).
 - `rules/docker-iccpd.mk` gained `_PACKAGE_NAME = iccpd`. No `critical_processes` file.
 
-### 9.5 docker-sflow — migrated
+### 9.4 docker-sflow — migrated
 
 - start.sh is rock-only.
 - `override-build` seds `DAEMON_ARGS` in `etc/init.d/hsflowd` (mirrors the Dockerfile).
 - hsflowd made usr-merge clean at the source (§12.1).
-- `install-python` carries only the config-engine wheels (no common pip packages).
 
-### 9.6 docker-sysmgr — not migrated
+### 9.5 docker-sysmgr — not migrated
 
 - Single daemon `/usr/bin/rebootbackend`; no start.sh — create one. `sysmgr.sh` is not
   copied by the Dockerfile, so do not add it (§5.2).
@@ -647,7 +655,7 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
 - `Dockerfile.j2` seds `%syslogtag%` into `/etc/rsyslog.conf`; decide whether the rock
   needs the same.
 
-### 9.7 docker-stp — not migrated
+### 9.6 docker-stp — not migrated
 
 - The existing start.sh is used by the Docker path and calls `supervisorctl start`; keep
   those calls outside the pebble branch and add `pebble start stpd; pebble start stpmgrd`
@@ -656,14 +664,13 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
   does not pull it in.
 - Same `%syslogtag%` rsyslog.conf sed as sysmgr.
 
-### 9.8 docker-nat — migrated
+### 9.7 docker-nat — migrated
 
 - `restore_nat_entries.py` runs inline in start.sh after natsyncd, not as a service (§6).
 - `override-prime` creates the iptables/ip6tables/ebtables/arptables family symlinks →
   `xtables-nft-multi` (organize cannot create symlinks).
-- `install-python` carries only the config-engine wheels.
 
-### 9.9 docker-lldp — migrated
+### 9.8 docker-lldp — migrated
 
 - lldpd command is the single-ASIC form; the multi-ASIC (`namespace_id`) branch of
   `supervisord.conf.j2` is not reproduced.
@@ -674,7 +681,7 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
 - `add-user` also creates the `_lldpd` user/group. Consumes `IMAGE_VERSION` (§3.2).
 - `lldp_syncd` comes from the `sonic_d` (DBSYNCD_PY3) wheel.
 
-### 9.10 docker-sonic-gnmi — migrated
+### 9.9 docker-sonic-gnmi — migrated
 
 - Extra debs: `sonic-mgmt-common` (CVL schema `/usr/sbin/schema/`, `cvl_cfg.json`,
   required by `CVL_SCHEMA_PATH` in gnmi-native.sh/dialout.sh) and `sonic-gnmi`
@@ -685,9 +692,9 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
   Confirm a library is absent from the base before adding it.
 - Consumes `IMAGE_VERSION` (§3.2).
 
-### 9.11 docker-snmp — migrated
+### 9.10 docker-snmp — migrated
 
-- Top-level `environment: PYTHONOPTIMIZE: "1"` — the one exception to "no environment".
+- Top-level `environment: PYTHONOPTIMIZE: "1"`.
 - `sysDescr_pass.py` is extracted from the asyncsnmp wheel with `unzip -p` in
   `override-build` (build-package `unzip`), not via `python3 -m sonic_ax_impl install`.
 - `install-python` build-packages `python3-dev`, `gcc`, `make` (hiredis compile).
@@ -695,7 +702,7 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
 - Gap: the chassis-packet `--enable_dynamic_frequency` branch of snmp-subagent is not
   reproduced.
 
-### 9.12 docker-dhcp-server — not migrated
+### 9.11 docker-dhcp-server — not migrated
 
 - `dhcpservd-ready` (`wait_for_dhcpservd.sh`) is a gate of up to 120s; kea-dhcp4 must start
   only after it exits, so `pebble start` order alone is not enough — poll the gate from
@@ -706,7 +713,7 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
 - psutil compile needs `python3-dev` + `build-essential` as `install-python`
   build-packages. Native-image install (§4.2) already done.
 
-### 9.13 docker-dhcp-relay — not migrated
+### 9.12 docker-dhcp-relay — not migrated
 
 - Approach B (§7.2): per-VLAN agents from a `pebble-layer.j2`; `.dep` must also
   filter-out `pebble-layer.j2`.
@@ -714,14 +721,14 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
   `start.sh` counts agents with `supervisorctl status | grep "^dhcp-relay:"` — needs a
   pebble equivalent. Consumes `IMAGE_VERSION`. Native-image install (§4.2) already done.
 
-### 9.14 docker-orchagent — not migrated
+### 9.13 docker-orchagent — not migrated
 
 - `docker-init.j2` is rendered at build time with `ENABLE_ASAN`, and at runtime renders
   `supervisord.conf.j2` (20 programs, heavily conditional), `critical_processes.j2` and
   `watchdog_processes.j2` — the same shape that pushed pmon and fpm-frr to approach B
   (§7.3); evaluate B before A.
 
-### 9.15 docker-platform-monitor — migrated
+### 9.14 docker-platform-monitor — migrated
 
 - **Approach B** (§7.3 fallback taken): services live in `pebble-layer.j2`, rendered and
   added by start.sh; `rockcraft.yaml` declares only rsyslogd/start. `.dep` also
@@ -737,7 +744,7 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
 - No grpc `.so` strip. `install-python` build-packages `python3-dev gcc g++ make`.
 - Known benign failure: `chassis_db_init` on VS (§12.2).
 
-### 9.16 docker-fpm-frr — migrated
+### 9.15 docker-fpm-frr — migrated
 
 - **Approach B** (§7.3 fallback taken): `pebble-layer.j2` with command-level conditions
   (e.g. `bgpd -M bmp`), `kill-delay: 0s` for supervisord `stopsignal=KILL`. `.dep` also
@@ -751,12 +758,12 @@ scope (database, mgmt-framework, eventd, router-advertiser) have their own desig
   shebangs to `/usr/bin/python3`.
 - `add-user` creates `frr` (uid/gid 300, from `rules/config`) and `frrvty`.
 
-### 9.17 platform/broadcom/docker-syncd-brcm — not migrated
+### 9.16 platform/broadcom/docker-syncd-brcm — not migrated
 
 - Services: syncd (`/usr/bin/syncd_start.sh`) **and** ledinit (`/usr/bin/start_led.sh`).
   Also ships start.sh, `bcmsh`, `rdb-cli`. Survey `Dockerfile.j2` and the `.mk` first.
 
-### 9.18 platform/vs/docker-syncd-vs — not migrated
+### 9.17 platform/vs/docker-syncd-vs — not migrated
 
 - Not in `build_rocks.sh` (also commented out on Noble). Its Dockerfile installs
   `libnl-3-dev`/`libnl-route-3-dev` debs — take them from the archive (§5.2).
@@ -770,8 +777,8 @@ Each container migration touches:
 | File | Description |
 |------|-------------|
 | `<container>/rockcraft.yaml` | Rockcraft manifest (from section 5 skeleton) |
-| `<container>/pebble-layer.j2` | **Only docker-dhcp-relay**: dynamic pebble layer template |
-| `<container>/start.sh` | **Only containers without one**: docker-mux, docker-macsec, docker-sflow (create with pebble branch) |
+| `<container>/pebble-layer.j2` | Dynamic pebble layer template |
+| `<container>/start.sh` | **Only containers without one**: docker-macsec, docker-sflow (create with pebble branch) |
 
 ### 10.2 Modified files
 
@@ -779,7 +786,7 @@ Each container migration touches:
 |------|--------|
 | `<container>/start.sh` | Append pebble detection and orchestration block (for containers with existing start.sh) |
 | `build_rocks.sh` | Append `"<container>"` to rocklist |
-| `rules/docker-<name>.dep` | `filter-out` the rockcraft.yaml from the dependency list (see §4.2) |
+| `rules/docker-<name>.dep` | `filter-out` the rockcraft.yaml and `pebble-layer.j2` from the dependency list (see §4.2) |
 | `rules/docker-<name>.mk` | Only for docker-dhcp-relay/dhcp-server/macsec: switch `SONIC_PACKAGES_LOCAL` → `SONIC_INSTALL_DOCKER_IMAGES` (see §4.2) |
 
 ### 10.3 Unmodified files
@@ -978,10 +985,8 @@ ship `sh` and accept `docker exec <c> sh -c '…'`.
 
 | Container | In rocklist? | Discriminator check |
 |-----------|--------------|---------------------|
-| database, mgmt-framework, eventd, radv (router-advertiser), lldp, snmp, gnmi | yes | `azure-labels=0`, `pebble services` returns a non-empty plan |
-| swss, pmon, syncd, teamd, bgp, mux, iccpd, nat, … | no | `azure-labels>=1`, `docker exec <c> supervisorctl status` works |
-
-As each of the 18 migrations lands, its container moves from the bottom row to the top.
+| database, lldp, … (every container in `build_rocks.sh` rocklist) | yes | `azure-labels=0`, `pebble services` returns a non-empty plan |
+| swss, syncd, … (everything else) | no | `azure-labels>=1`, `docker exec <c> supervisorctl status` works |
 
 #### 11.6.3 Expected pebble service state (per migrated container)
 
@@ -998,12 +1003,6 @@ docker exec <container> pebble services
 If any service is in `backoff` or `error` state, that should be an error — except pmon's
 pre-existing `chassis_db_init` on VS, which exits 1 (no chassis / no platform API, identical
 to the Docker path) and is treated as benign (§12.2, §11.6.4 exclusion).
-
-Note on one-shot services: a `startup: enabled` service whose command runs to completion
-and exits 0 will show `inactive` (with `on-success: ignore`), and a quick (<1s) exit also
-marks the *spawning change* as `Error` "exited quickly with code 0, will ignore" even though
-the service itself is healthy. This pebble behavior is benign for init/gate one-shots — see
-the §11.6.4 exclusion list; it is distinct from a genuine `error` **service state**.
 
 Each service's state should match the respecitve service's state on respecitve container on
 the baseline remote switch. For example, if `docker exec database supervisorctl status redis` 
@@ -1024,7 +1023,7 @@ For each rock container, run the two checks
    ```
 
 2. Logs — no `ImportError`, `Traceback`, `cannot open shared object file`, `undefined
-   symbol`, or crash loop:
+   symbol`, `exited quickly with code 0, will ignore` or crash loop:
 
    ```bash
    docker exec <c> pebble logs            # all buffered service logs (30 lines default)
@@ -1033,19 +1032,13 @@ For each rock container, run the two checks
 
    Fall back to `docker logs` for the same stream if `pebble logs` shows nothing. Filtering
    advice: only `ImportError`, `Traceback`, `cannot open shared object file`,
-   `undefined symbol`, and `panic:` are real defect markers. Do **not** flag as defects the
-   benign noise seen routinely on a healthy VS image:
+   `undefined symbol`, `exited quickly with code 0, will ignore` and `panic:` are real 
+   defect markers. Do **not** flag as defects the benign noise seen routinely on a healthy 
+   VS image:
 
    - `rsyslogd: omrelp ... error opening connection to remote peer` — expected when no
      central syslog server is reachable;
-   - `... 'events' list is missing or empty. Skipping ...` (eventd eventdb) — normal.
-   - `service start attempt: exited quickly with code 0, will ignore` (a change-level
-     `Error`, not a service state) — pebble's 1s `okayDelay` marks any one-shot that
-     finishes in under a second as "exited quickly"; with `on-success: ignore` the service
-     itself lands in `inactive`, so this is expected for init/gate one-shots (eventd
-     `eventdb`, lldp `waitfor-lldp-ready`, bgp `zsocket`). Root cause is pebble v1.x
-     `internals/overlord/servstate/handlers.go` (`okayDelay = 1 * time.Second`); there is no
-     config to suppress it, so it must not be flagged as a defect.
+   - `... 'events' list is missing or empty. Skipping ...` — normal.
    - `gnmi-native` startup `jinja2.exceptions.UndefinedError: 'GNMI' is undefined` from
      `telemetry_vars.j2` — telemetry/GNMI is not configured on a default VS config; the
      native gNMI server falls back to default args and stays `active` (matches Docker path).
@@ -1059,14 +1052,14 @@ For each rock container, run the two checks
 
 #### 11.6.5 Scripted pass/fail harness
 
-Run once per image to get one-line signal per container. Adapt the two `case` arms to the
-currently migrated set:
+Run once per image to get one-line signal per container. Fill `ROCKS` with the container
+names of the current `build_rocks.sh` rocklist:
 
 ```bash
 #!/usr/bin/env bash
 # Verify rock/pebble containers under a booted SONiC vs image.  Args: none.
 set -u
-ROCKS=(database mgmt-framework eventd radv lldp snmp gnmi)   # update as migrations land
+ROCKS=(database lldp ...)   # container names of the build_rocks.sh rocklist
 # Real defect markers only (see §11.6.4 for the benign-noise exclusion list).
 DEFECTS='ImportError|Traceback|cannot open shared object file|undefined symbol|panic:'
 for c in "${ROCKS[@]}"; do
@@ -1232,13 +1225,7 @@ rock/pebble layer only (e.g. gate `chassis_db_init` behind the same modular-chas
 as `chassisd`, or `skip` it via the rock's own daemon-control path) if it is ever revisited;
 as of now it is intentionally left alone.
 
-### 12.3 lldp / bgp: gate one-shots report an `Error` change (benign)
-
-Gate one-shots that finish in <1s hit pebble's 1s `okayDelay` and report "exited quickly with
-code 0, will ignore" on the change only; the service is `inactive` and the gated daemons
-start fine. Benign (§11.6.4 exclusion list).
-
-### 12.4 gnmi-native: `UndefinedError: 'GNMI' is undefined` (benign)
+### 12.3 gnmi-native: `UndefinedError: 'GNMI' is undefined` (benign)
 
 At boot (telemetry not configured on the default VS config) gnmi-native logs this traceback;
 it falls back to default args and stays `active`. Pre-existing; benign (§11.6.4).
