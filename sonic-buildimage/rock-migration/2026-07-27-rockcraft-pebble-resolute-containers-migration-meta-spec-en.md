@@ -417,6 +417,75 @@ parts:
   The event listener dependent-startup controls the starting order in supervisord. Don't be 
   cheated by a single config item, always analyze the services behavior in a container-wide view.
 
+### 5.3 `install-python` pitfall: wheel `data_files` with relative destinations
+
+**Root cause.** Some wheels' `setup.py` declare `data_files=[(dest, [...]), ...]` where
+`dest` is a *relative* path (not starting with `/`). distutils/setuptools resolve a relative
+`data_files` destination against `sys.prefix` at install time. The two paths disagree on what
+`sys.prefix` is:
+
+- **Docker path**: `pip3 install` uses the system interpreter, whose default `sys.prefix` is
+  `/usr/local`. A relative destination `'yang-models'` lands at `/usr/local/yang-models`.
+- **Rock path**: rockcraft's `python` plugin creates its pip environment with the rock root
+  itself as the prefix (`${CRAFT_PART_INSTALL}`, effectively `/`). The same relative
+  destination lands at `/yang-models` instead — a different absolute path.
+
+**Impact and affected wheels.** Two wheels in the common skeleton's `python-packages` lists
+hit this:
+
+| Wheel | `data_files` destinations (relative) | Hardcoded consumers expecting `/usr/local/...` |
+|---|---|---|
+| `sonic_yang_models` | `yang-models`, `cvlyang-models` | `YANG_MODELS_DIR`/`YANG_DIR = "/usr/local/yang-models"` in `sonic_yang_cfg_generator.py`, `config_mgmt.py`, `sonic-cfg-help` |
+| `sonic_frr_mgmt_framework` | `sonic/frrcfgd` | `-T /usr/local/sonic/frrcfgd` in `gen_frr.conf.j2`'s `sonic-cfggen` invocation (docker-fpm-frr `start.sh`) |
+
+`sonic_yang_models` is part of the common config-engine wheel set every migrated container
+installs (§5), so this was a **universal** defect, silently present in all 16 currently
+migrated/in-progress containers, not specific to one of them — confirmed empirically by
+`docker export`ing the already-shipped `docker-database` rock and finding `yang-models/` and
+`cvlyang-models/` at the image root instead of under `usr/local/`. Any code path that reads
+YANG models at runtime in a rock (`sonic-cfggen -y`, `config_mgmt`, CLI auto-generation) would
+fail to find them. The `sonic_frr_mgmt_framework` instance of the same bug was found and fixed
+first, in `docker-fpm-frr` (§9.15).
+
+**No generic framework-level fix exists.** rockcraft's `python` plugin exposes only
+`python-packages`/`python-requirements`/`python-constraints` — no pip `--prefix`/`--target`
+passthrough. This isn't an oversight: the plugin's pip environment prefix is deliberately the
+rock root, because Rockcraft's `sitecustomize.py` (injected to make the rock's Python
+packages importable regardless of how the interpreter is invoked) hardcodes the lookup path
+`/lib/python{x.y}/site-packages`. Pointing pip's prefix elsewhere (e.g. via `PIP_PREFIX`) would
+move the installed *packages* out of that lookup path too and break imports entirely — a much
+worse failure than the `data_files` misplacement itself.
+
+**Fix: a declarative `organize:` entry on the `install-python` part**, not an imperative `mv`
+in `override-prime`:
+
+```yaml
+install-python:
+  plugin: python
+  ...
+  stage-packages:
+    - python3-venv
+  organize:
+    yang-models: usr/local/yang-models
+    cvlyang-models: usr/local/cvlyang-models
+```
+
+`organize` runs once per part, right after that part's build step and before stage (see
+craft-parts `executor/part_handler.py`: "Organize the installed files as requested. We do
+this in the build step..."), which is exactly when the python plugin's `pip install` has just
+produced `yang-models`/`cvlyang-models` in `${CRAFT_PART_INSTALL}`. Its directory-to-directory
+handling (`executor/organize.py`) is `link_or_copy_tree` followed by `rmtree` of the source —
+behaviorally identical to a hand-written `mkdir -p && mv && rmdir`, but declarative, consistent
+with the "organize over cp" principle (§5.1), and silently a no-op if the source directory is
+absent (no `if [ -d ... ]` guard needed). This is strictly preferred over the `frrcfgd` fix's
+original `override-prime` shell block (§9.15); both are now `organize:` entries.
+
+The true root-cause fix — changing `sonic-yang-models`/`sonic-frr-mgmt-framework`'s `setup.py`
+to use `package_data`/`importlib.resources` instead of `data_files`, which is prefix-independent
+— requires editing the wheel's packaging *and* every downstream hardcoded path reader, and
+affects the Docker path's file layout too. That is out of scope for the buildimage-side rock
+migration and is not attempted here; `organize:` is a consumer-side correction, same spirit as
+§5.2's "consume stock Ubuntu packages from the archive" rule.
 
 ## 6. start.sh Universal Pattern
 
@@ -624,12 +693,14 @@ libnexthopgroup, libdashapi, swss).
   additionally drops `cli-plugin-tests`.
 - wpasupplicant made usr-merge clean at the source (§12.1).
 - Installed as a native docker image, not an SPM package (§4.2; done).
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.2 docker-teamd — migrated
 
 - teammgrd `kill-delay: 60s` (supervisord `stopwaitsecs=60`); teamsyncd's `startsecs=5`
   has no pebble equivalent — it is only started after teammgrd in start.sh.
 - Extra deb: `libteam-utils`.
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.3 docker-iccpd — migrated
 
@@ -639,12 +710,14 @@ libnexthopgroup, libdashapi, swss).
 - `override-prime` creates `iptables`/`ebtables` → `xtables-nft-multi` symlinks (postinst
   never runs in a rock).
 - `rules/docker-iccpd.mk` gained `_PACKAGE_NAME = iccpd`. No `critical_processes` file.
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.4 docker-sflow — migrated
 
 - start.sh is rock-only.
 - `override-build` seds `DAEMON_ARGS` in `etc/init.d/hsflowd` (mirrors the Dockerfile).
 - hsflowd made usr-merge clean at the source (§12.1).
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.5 docker-sysmgr — not migrated
 
@@ -669,6 +742,7 @@ libnexthopgroup, libdashapi, swss).
 - `restore_nat_entries.py` runs inline in start.sh after natsyncd, not as a service (§6).
 - `override-prime` creates the iptables/ip6tables/ebtables/arptables family symlinks →
   `xtables-nft-multi` (organize cannot create symlinks).
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.8 docker-lldp — migrated
 
@@ -680,6 +754,7 @@ libnexthopgroup, libdashapi, swss).
   (via `organize`) wins.
 - `add-user` also creates the `_lldpd` user/group. Consumes `IMAGE_VERSION` (§3.2).
 - `lldp_syncd` comes from the `sonic_d` (DBSYNCD_PY3) wheel.
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.9 docker-sonic-gnmi — migrated
 
@@ -691,6 +766,7 @@ libnexthopgroup, libdashapi, swss).
   stage-package: rockcraft drops the staged copy during PRIME as a duplicate of the base.
   Confirm a library is absent from the base before adding it.
 - Consumes `IMAGE_VERSION` (§3.2).
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.10 docker-snmp — migrated
 
@@ -701,6 +777,7 @@ libnexthopgroup, libdashapi, swss).
 - `add-user` also creates `Debian-snmp`. Consumes `IMAGE_VERSION` (§3.2).
 - Gap: the chassis-packet `--enable_dynamic_frequency` branch of snmp-subagent is not
   reproduced.
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.11 docker-dhcp-server — not migrated
 
@@ -743,6 +820,7 @@ libnexthopgroup, libdashapi, swss).
   `etc/rsyslog.conf` from the container dir.
 - No grpc `.so` strip. `install-python` build-packages `python3-dev gcc g++ make`.
 - Known benign failure: `chassis_db_init` on VS (§12.2).
+- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.15 docker-fpm-frr — migrated
 
@@ -754,8 +832,9 @@ libnexthopgroup, libdashapi, swss).
   modes, default-gateway metric, `sr0` dummy interface. `zsocket` is a gate service
   polled from start.sh.
 - `override-build` copies the `frr/` template tree with `cp -a`; `install-python`
-  `override-prime` moves `frrcfgd` under `usr/local/sonic/` and rewrites console-script
-  shebangs to `/usr/bin/python3`.
+  `organize:`s `sonic/frrcfgd` to `usr/local/sonic/frrcfgd` (§5.3, same `data_files`
+  pitfall as `sonic_yang_models`) and rewrites console-script shebangs to
+  `/usr/bin/python3`.
 - `add-user` creates `frr` (uid/gid 300, from `rules/config`) and `frrvty`.
 
 ### 9.16 platform/broadcom/docker-syncd-brcm — not migrated
@@ -1022,8 +1101,8 @@ For each rock container, run the two checks
    docker exec <c> pebble health            # overall: healthy
    ```
 
-2. Logs — no `ImportError`, `Traceback`, `cannot open shared object file`, `undefined
-   symbol`, `exited quickly with code 0, will ignore` or crash loop:
+2. Logs — no `ImportError`, `Traceback`, `cannot open shared object file`, `undefined symbol`,
+   `exited quickly with code 0, will ignore`, `bad interpreter` or crash loop:
 
    ```bash
    docker exec <c> pebble logs            # all buffered service logs (30 lines default)
@@ -1031,10 +1110,8 @@ For each rock container, run the two checks
    ```
 
    Fall back to `docker logs` for the same stream if `pebble logs` shows nothing. Filtering
-   advice: only `ImportError`, `Traceback`, `cannot open shared object file`,
-   `undefined symbol`, `exited quickly with code 0, will ignore` and `panic:` are real 
-   defect markers. Do **not** flag as defects the benign noise seen routinely on a healthy 
-   VS image:
+   only the error keyword listed above. Do **not** flag as defects the benign noise seen 
+   routinely on a healthy VS image:
 
    - `rsyslogd: omrelp ... error opening connection to remote peer` — expected when no
      central syslog server is reachable;
@@ -1061,7 +1138,7 @@ names of the current `build_rocks.sh` rocklist:
 set -u
 ROCKS=(database lldp ...)   # container names of the build_rocks.sh rocklist
 # Real defect markers only (see §11.6.4 for the benign-noise exclusion list).
-DEFECTS='ImportError|Traceback|cannot open shared object file|undefined symbol|panic:'
+DEFECTS='ImportError|Traceback|cannot open shared object file|undefined symbol|panic|bad interpreter:'
 for c in "${ROCKS[@]}"; do
   if docker exec "$c" pebble services >/dev/null 2>&1; then
     if docker exec "$c" pebble logs -n=all 2>&1 | grep -Eq "$DEFECTS"; then
