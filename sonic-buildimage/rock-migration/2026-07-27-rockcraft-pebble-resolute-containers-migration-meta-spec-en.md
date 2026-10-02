@@ -107,7 +107,7 @@ container, then removes it during cleanup). The propagation chain has three link
 **Scope it to actual consumers.** Only containers whose `start.sh` passes `IMAGE_VERSION`
 to `container_startup.py` (`... -v ${IMAGE_VERSION}`) need any of the above. For those,
 add **both** the `override-prime` copy and the `source`. Containers that never reference
-`IMAGE_VERSION` (e.g. docker-eventd, docker-database, docker-sonic-mgmt-framework) must not
+`IMAGE_VERSION` must not
 carry the `envs` copy — a copied-but-unsourced `envs` file is dead weight, and the
 `build_rocks.sh` generator alone is not a reason to include it.
 
@@ -686,38 +686,7 @@ Not repeated per entry: every swss-layer rock also
 `dpkg -x`'s the swss-layer debs (libsairedis, libsaimetadata, libteam5, libteamdctl0,
 libnexthopgroup, libdashapi, swss).
 
-### 9.1 docker-macsec — migrated
-
-- start.sh is rock-only (the Dockerfile does not copy it) and holds only the pebble branch.
-- `etc/wpa_supplicant.conf` and `cli/` land by `source: .` path, not `organize`; `prime:`
-  additionally drops `cli-plugin-tests`.
-- wpasupplicant made usr-merge clean at the source (§12.1).
-- Installed as a native docker image, not an SPM package (§4.2; done).
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.2 docker-teamd — migrated
-
-- teammgrd `kill-delay: 60s` (supervisord `stopwaitsecs=60`); teamsyncd's `startsecs=5`
-  has no pebble equivalent — it is only started after teammgrd in start.sh.
-- Extra deb: `libteam-utils`.
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.3 docker-iccpd — migrated
-
-- `iccpd.sh` is the service command: mclagsyncd in background, iccpd in foreground.
-- `chmod +x start.sh iccpd.sh` in `override-build` (both are 100644 in git; the Dockerfile
-  does the same chmod).
-- `override-prime` creates `iptables`/`ebtables` → `xtables-nft-multi` symlinks (postinst
-  never runs in a rock).
-- `rules/docker-iccpd.mk` gained `_PACKAGE_NAME = iccpd`. No `critical_processes` file.
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.4 docker-sflow — migrated
-
-- start.sh is rock-only.
-- `override-build` seds `DAEMON_ARGS` in `etc/init.d/hsflowd` (mirrors the Dockerfile).
-- hsflowd made usr-merge clean at the source (§12.1).
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
+Migrated rocks have been removed from this section.
 
 ### 9.5 docker-sysmgr — not migrated
 
@@ -736,48 +705,6 @@ libnexthopgroup, libdashapi, swss).
 - The Dockerfile's `libpython3.11` becomes `libpython3.14`; stage it explicitly — `python3`
   does not pull it in.
 - Same `%syslogtag%` rsyslog.conf sed as sysmgr.
-
-### 9.7 docker-nat — migrated
-
-- `restore_nat_entries.py` runs inline in start.sh after natsyncd, not as a service (§6).
-- `override-prime` creates the iptables/ip6tables/ebtables/arptables family symlinks →
-  `xtables-nft-multi` (organize cannot create symlinks).
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.8 docker-lldp — migrated
-
-- lldpd command is the single-ASIC form; the multi-ASIC (`namespace_id`) branch of
-  `supervisord.conf.j2` is not reproduced.
-- `waitfor-lldp-ready` is kept as a pebble gate service, not inline (benign "exited
-  quickly", §12.3).
-- `override-build` removes the packaged `etc/default/lldpd` so the container's own copy
-  (via `organize`) wins.
-- `add-user` also creates the `_lldpd` user/group. Consumes `IMAGE_VERSION` (§3.2).
-- `lldp_syncd` comes from the `sonic_d` (DBSYNCD_PY3) wheel.
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.9 docker-sonic-gnmi — migrated
-
-- Extra debs: `sonic-mgmt-common` (CVL schema `/usr/sbin/schema/`, `cvl_cfg.json`,
-  required by `CVL_SCHEMA_PATH` in gnmi-native.sh/dialout.sh) and `sonic-gnmi`
-  (`telemetry`, `dialout_client_cli`, `/usr/models/yang/`).
-- `libxml2`/`libevent-2.1-7` are not needed (`objdump -p` shows no NEEDED entry).
-  `libpam.so.0` is supplied by the `ubuntu@26.04` base layer, so it must **not** be a
-  stage-package: rockcraft drops the staged copy during PRIME as a duplicate of the base.
-  Confirm a library is absent from the base before adding it.
-- Consumes `IMAGE_VERSION` (§3.2).
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.10 docker-snmp — migrated
-
-- Top-level `environment: PYTHONOPTIMIZE: "1"`.
-- `sysDescr_pass.py` is extracted from the asyncsnmp wheel with `unzip -p` in
-  `override-build` (build-package `unzip`), not via `python3 -m sonic_ax_impl install`.
-- `install-python` build-packages `python3-dev`, `gcc`, `make` (hiredis compile).
-- `add-user` also creates `Debian-snmp`. Consumes `IMAGE_VERSION` (§3.2).
-- Gap: the chassis-packet `--enable_dynamic_frequency` branch of snmp-subagent is not
-  reproduced.
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
 
 ### 9.11 docker-dhcp-server — not migrated
 
@@ -804,38 +731,6 @@ libnexthopgroup, libdashapi, swss).
   `supervisord.conf.j2` (20 programs, heavily conditional), `critical_processes.j2` and
   `watchdog_processes.j2` — the same shape that pushed pmon and fpm-frr to approach B
   (§7.3); evaluate B before A.
-
-### 9.14 docker-platform-monitor — migrated
-
-- **Approach B** (§7.3 fallback taken): services live in `pebble-layer.j2`, rendered and
-  added by start.sh; `rockcraft.yaml` declares only rsyslogd/start. `.dep` also
-  filter-outs `pebble-layer.j2`.
-- start.sh is rock-only (the Docker path keeps `docker_init.j2` as entrypoint, excluded
-  from prime): no `pgrep -x pebble` branch, keeps only the `sonic_platform` wheel install
-  from `docker_init.j2`; mellanox/aspeed/bluefield detection dropped (vs/broadcom only).
-- `delay` is a gate service polled from start.sh; daemons are started in a fixed-order
-  loop with `|| true`. Long-running daemons use `on-success: ignore` to mirror
-  supervisord `autorestart=unexpected`.
-- Own rsyslog.conf: `override-build` removes the packaged one, `override-prime` copies
-  `etc/rsyslog.conf` from the container dir.
-- No grpc `.so` strip. `install-python` build-packages `python3-dev gcc g++ make`.
-- Known benign failure: `chassis_db_init` on VS (§12.2).
-- `install-python` `organize:`s `yang-models`/`cvlyang-models` to `usr/local/{yang,cvlyang}-models` (§5.3).
-
-### 9.15 docker-fpm-frr — migrated
-
-- **Approach B** (§7.3 fallback taken): `pebble-layer.j2` with command-level conditions
-  (e.g. `bgpd -M bmp`), `kill-delay: 0s` for supervisord `stopsignal=KILL`. `.dep` also
-  filter-outs `pebble-layer.j2`.
-- start.sh is rock-only (the Docker entrypoint stays `docker_init.sh`, excluded from
-  prime) and absorbs `docker_init.sh`: `/var/{log,lib,run}/frr` ownership, the 4 config
-  modes, default-gateway metric, `sr0` dummy interface. `zsocket` is a gate service
-  polled from start.sh.
-- `override-build` copies the `frr/` template tree with `cp -a`; `install-python`
-  `organize:`s `sonic/frrcfgd` to `usr/local/sonic/frrcfgd` (§5.3, same `data_files`
-  pitfall as `sonic_yang_models`) and rewrites console-script shebangs to
-  `/usr/bin/python3`.
-- `add-user` creates `frr` (uid/gid 300, from `rules/config`) and `frrvty`.
 
 ### 9.16 platform/broadcom/docker-syncd-brcm — not migrated
 
