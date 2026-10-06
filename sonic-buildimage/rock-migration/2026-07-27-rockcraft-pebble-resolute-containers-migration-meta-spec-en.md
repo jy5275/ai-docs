@@ -789,6 +789,8 @@ This step is to ensure that all `docker-<name>`'s dependencies has been built.
 If `target/docker-<name>.gz` file already exists, this may indicate that all dependencies are ready,
 we can skip this step. Unless step 11.2 reports error.
 ```bash
+make init
+make configure PLATFORM=vs # or broadcom for syncd-brcm container
 make target/docker-<name>.gz
 ```
 
