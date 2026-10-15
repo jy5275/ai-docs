@@ -94,3 +94,10 @@ Moved the run_script hook script to Kea 3.0's only accepted directory, in both p
 - `dockers/docker-dhcp-server/rockcraft.yaml` `organize: lease_update.sh: usr/share/kea/scripts/lease_update.sh`.
 
 Verified: wheel build runs the unit tests (388 passed); Docker-path image: kea loads the hook and reaches `DHCP4_STARTED`; rock in the VS VM: `dhcpservd`/`kea-dhcp4`/`rsyslogd` active, `start` inactive, all pebble changes Done, healthy, `RUN_SCRIPT_LOAD` in kea log. `make` does not track `src/` timestamps: delete the wheel/`docker-*.gz` (+ `.log`) to force a rebuild. Helper scripts: `tools/build_one_rock.sh`, `tools/vm.sh`.
+
+## Scope update (2026-10-09)
+
+- Scope is limited to making `docker-dhcp-server` buildable from `rockcraft.yaml`; SONiC default behavior is unchanged. `build_rocks.sh` (rocklist) and `rules/config.user` (`INCLUDE_DHCP_SERVER`) changes were **reverted by the owner**: dhcp-server is disabled by default, so it is not packed. To build the rock on demand: `make target/docker-dhcp-server.gz` (needs `INCLUDE_DHCP_SERVER=y` only for packing it into an image) then `tools/build_one_rock.sh dockers/docker-dhcp-server`.
+- HEAD moved on (rebase): `build_rocks.sh` now carries the Dockerfile image's SONiC labels onto the rock (requires a labelled `target/docker-<name>.gz` first), and `docker-dhcp-server.mk` is `SONIC_PACKAGES_LOCAL` again (sonic-package-manager install) -- the "native image install already done" note above is stale.
+- New convention (commit `2d91b2ca6`): services listed in `critical_processes` get `on-success: ignore` + `on-failure: shutdown`. Applied to `dhcpservd` and `kea-dhcp4` (`critical_processes` = `group:dhcp-server-ipv4`). Verified on a bare machine: the rock carries 10 labels incl. `com.azure.sonic.manifest`; without redis `dhcpservd` fails and pebble shuts the container down (exit 10) as intended.
+- Not re-verified in a VS VM after the rebase: that needs `INCLUDE_DHCP_SERVER=y` image build, which is outside the agreed scope. The earlier VM run (2026-10-05) covered the functional path.
